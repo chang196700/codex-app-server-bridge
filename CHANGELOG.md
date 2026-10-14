@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.0...v0.1.1) - 2026-10-14
+
+### Fixed
+
+- refresh pending changelogs from complete Git history
+
 ## [0.1.0](https://github.com/chang196700/codex-app-server-bridge/releases/tag/v0.1.0) - 2026-10-14
 
 ### Other
