@@ -17,7 +17,7 @@ cargo build --release --locked
 构建产物为 `target/release/codex-app-server-bridge`；Windows 为同目录下的 `codex-app-server-bridge.exe`。以下命令假设程序已加入 `PATH`；也可以直接使用产物的绝对路径。
 
 ```sh
-# 创建示例配置，已有文件不会被覆盖
+# 创建 ~/.codex-app-server-bridge/config.toml，已有文件不会被覆盖
 codex-app-server-bridge init-config
 
 # 前台运行；不带子命令也等同于 run
@@ -45,7 +45,9 @@ codex-app-server-bridge --config /path/to/bridge.toml run
 
 ## 配置
 
-默认配置为 `~/.codex-app-server-bridge`：这是一个**没有扩展名的 TOML 文件**，不是目录。Windows 中 `~` 对应当前用户主目录。默认文件不存在时使用内置配置；显式 `--config` 指定的文件不存在则报错。
+默认配置为 `~/.codex-app-server-bridge/config.toml`。`.codex-app-server-bridge` 目录也用于存放为后台启动安装的程序副本。Windows 中 `~` 对应当前用户主目录。默认文件不存在时使用内置配置。读取显式 `--config` 指定的文件时，文件不存在则报错；`init-config` 和 `config set` 可以创建该文件。`init-config` 会创建目录及示例配置，不覆盖已有配置。
+
+如果 `~/.codex-app-server-bridge` 仍是旧版 TOML 文件，选用默认配置时会自动将其内容迁移到 `~/.codex-app-server-bridge/config.toml`，并将原内容保留为 `~/.codex-app-server-bridge.legacy-<唯一标识>.toml.bak`。显式 `--config` 指向旧默认路径时也会转为使用新文件。无效 TOML 文件和符号链接不会迁移。迁移中断时会保留备份，重新执行命令可继续恢复，不覆盖内容冲突的文件。迁移保留原配置，因此随后执行 `init-config` 仍会拒绝覆盖已有文件。
 
 ```toml
 # 可省略；默认使用 CODEX_HOME，未设置时使用 ~/.codex
@@ -70,13 +72,35 @@ publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 tru
 
 | 项目 | 优先级，从高到低 |
 | --- | --- |
-| 配置文件 | `--config`；否则所选用户主目录下的 `.codex-app-server-bridge` |
+| 配置文件 | `--config`；否则 `--user-home` 或操作系统当前用户主目录下的 `.codex-app-server-bridge/config.toml` |
 | 用户主目录 | `--user-home` → TOML `user_home` → 操作系统当前用户主目录 |
 | Codex 目录 | `--codex-home` → TOML `codex_home` → 环境变量 `CODEX_HOME` → 所选用户主目录下的 `.codex` |
 | socket 路径 | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | 端口 | `--port` → TOML `port` → `0` |
 
-路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。TOML 未知字段会报错，避免拼写错误被忽略。
+TOML 中的 `user_home` 在读取配置后生效，不会改变已经选定的配置文件路径。路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。TOML 未知字段会报错，避免拼写错误被忽略。
+
+### 查看和修改配置
+
+```sh
+codex-app-server-bridge config list
+codex-app-server-bridge config get port
+codex-app-server-bridge config set port 8765
+codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
+
+# 查看或修改自定义配置文件
+codex-app-server-bridge --config /path/to/bridge.toml config get port
+codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
+```
+
+`config list` 输出配置文件与内置默认值合并后的 JSON 对象。`config get KEY` 仅以 JSON 输出指定字段的值：字符串带引号，未设置的可选字段为 `null`。这些命令显示配置值，不应用 `CODEX_HOME` 等运行时环境变量或 `--port` 等命令行覆盖。
+
+`config set KEY VALUE` 接受与字段类型匹配的值。数字和布尔值使用 TOML 语法；路径、`host` 等字符串字段也可直接传入裸字符串，如上方示例。没有用于删除字段的特殊 unset 或 `null` 语法。该命令会创建缺失的配置文件，包括显式 `--config` 指定的文件；保留其他字段和注释，校验完整配置后再写入，并以 JSON 输出保存后的值，不会将运行时覆盖值写回文件。
+
+配置键支持使用点分路径导航。当前配置结构只有顶层字段，因此直接使用 `port`、`socket_path` 等字段名；目前没有可通过点分路径访问的嵌套配置项。未知字段或子键会被拒绝。
+
+修改配置不会使运行中的实例自动重新加载。前台进程需要重启；已安装的服务需要重新执行相同的 `service install` 命令，更新 `<state_dir>/service.toml` 并重启服务。单独执行 `service start` 仍会使用原有快照。
 
 ## 环境变量如何生效
 
@@ -84,7 +108,7 @@ publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 tru
 
 已有配置若使用旧名称 `publish_environment`，请将其替换为 `publish_codex_app_server_ws_url_environment`；已安装的服务还需重新运行 `service install` 更新配置快照。
 
-需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge` 中开启：
+需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge/config.toml` 中开启：
 
 ```toml
 publish_codex_app_server_ws_url_environment = true
@@ -120,7 +144,9 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 
 ## 安装服务或开机启动
 
-先将二进制放到长期保留的位置，再安装。安装记录的是**当前二进制绝对路径**；安装后不要移动、删除它，也不要清理对应构建目录。需要更换位置时，从新位置重新安装。
+`service install` 会将当前程序复制到所选用户主目录下的 `~/.codex-app-server-bridge/codex-app-server-bridge`（Windows 为 `codex-app-server-bridge.exe`），并将这个稳定路径注册为启动程序。可以直接从构建目录或下载目录安装，安装后可删除来源文件；服务或启动项使用期间需保留安装目录中的副本。升级时，使用新版程序再次执行相同的 `service install` 命令，安装会更新程序副本和配置快照并重启实例。
+
+安装目录由所选 `user_home` 决定，不随 `--config` 的位置改变。安装不会自动将目录加入 `PATH`，后续可使用安装副本的完整路径执行命令。从安装副本本身执行 `service install` 时会跳过自复制，更新配置及启动注册；升级版本时应从新构建或下载的程序执行 `service install`。
 
 `service install` 会注册并立即启动；重复安装会更新配置并重新启动。安装将当前有效配置保存到 `<state_dir>/service.toml`，后台进程读取此快照。修改原始配置、端口或 `CODEX_HOME` 后，需要再次运行 `service install` 才会应用；单独 `service start` 不会重新生成快照。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
 
@@ -131,13 +157,14 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
 & $bridge service install --scope user
+$bridge = Join-Path $HOME '.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope user
 & $bridge service stop --scope user
 & $bridge service start --scope user
 & $bridge service uninstall --scope user
 ```
 
-Run 启动命令超过 260 个 UTF-16 字符时安装会明确失败；请使用更短的二进制/状态目录路径，或选择系统服务。`stop` 会请求正常退出并等待实例锁释放，不使用强制结束进程。
+Run 启动命令超过 260 个 UTF-16 字符时安装会明确失败；请使用更短的状态目录路径，或选择系统服务。`stop` 会请求正常退出并等待实例锁释放，不使用强制结束进程。
 
 ### Windows：原生系统服务
 
@@ -146,6 +173,7 @@ Run 启动命令超过 260 个 UTF-16 字符时安装会明确失败；请使用
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
 & $bridge --user-home 'C:\Users\alice' --codex-home 'C:\Users\alice\.codex' service install --scope system
+$bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope system
 & $bridge service stop --scope system
 & $bridge service start --scope system
@@ -160,10 +188,10 @@ $bridge = 'C:\Tools\codex-app-server-bridge.exe'
 
 ```sh
 codex-app-server-bridge service install --scope user
-codex-app-server-bridge service status --scope user
-codex-app-server-bridge service stop --scope user
-codex-app-server-bridge service start --scope user
-codex-app-server-bridge service uninstall --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service status --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service stop --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service start --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service uninstall --scope user
 ```
 
 服务文件为 `~/.config/systemd/user/codex-app-server-bridge.service`。要在用户尚未登录时也启动用户管理器、并在退出登录后保持运行，由有权限的用户执行：
@@ -179,17 +207,17 @@ loginctl enable-linger alice
 系统安装必须明确提供目标用户名、用户主目录。建议同时明确 Codex 目录，以免 `sudo` 改变或清除 `CODEX_HOME`。
 
 ```sh
-sudo /usr/local/bin/codex-app-server-bridge \
+sudo ./target/release/codex-app-server-bridge \
   --user-home /home/alice --codex-home /home/alice/.codex \
   service install --scope system --username alice
 
-sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service status --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service stop --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service start --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service status --scope system --username alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service stop --scope system --username alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service start --scope system --username alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
 ```
 
-服务文件为 `/etc/systemd/system/codex-app-server-bridge.service`。服务进程以 `alice` 的身份运行，需要能够访问二进制、配置快照和 Codex socket。安装会设置专用状态目录及快照的所有者；用户主目录内为此新建的父目录也归目标用户所有。已有父目录的所有者和权限保持不变，不递归更改用户主目录或 Codex 目录权限。用户主目录必须事先存在。
+服务文件为 `/etc/systemd/system/codex-app-server-bridge.service`。服务进程以 `alice` 的身份运行，需要能够访问二进制、配置快照和 Codex socket。安装会将专用安装目录、状态目录、程序副本及配置快照归属目标用户，程序副本权限为 `0755`；用户主目录内为此新建的父目录也归目标用户所有。已有父目录的所有者和权限保持不变，不递归更改用户主目录或 Codex 目录权限。用户主目录必须事先存在。
 
 ### macOS：登录启动 LaunchAgent
 
@@ -197,10 +225,10 @@ sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home
 
 ```sh
 codex-app-server-bridge service install --scope user
-codex-app-server-bridge service status --scope user
-codex-app-server-bridge service stop --scope user
-codex-app-server-bridge service start --scope user
-codex-app-server-bridge service uninstall --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service status --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service stop --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service start --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service uninstall --scope user
 ```
 
 配置文件为 `~/Library/LaunchAgents/io.codex.app-server-bridge.plist`，注册到当前用户的 `gui/<uid>` 域。没有 GUI 登录会话时应选择合适的系统服务方式。
@@ -208,21 +236,21 @@ codex-app-server-bridge service uninstall --scope user
 ### macOS：开机启动 LaunchDaemon
 
 ```sh
-sudo /usr/local/bin/codex-app-server-bridge \
+sudo ./target/release/codex-app-server-bridge \
   --user-home /Users/alice --codex-home /Users/alice/.codex \
   service install --scope system --username alice
 
-sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service status --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service stop --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service start --scope system --username alice
-sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
+sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service status --scope system --username alice
+sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service stop --scope system --username alice
+sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service start --scope system --username alice
+sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
 配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 按指定用户身份运行。用户目录或 Codex socket 在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
 
 ### 卸载与日志
 
-`service uninstall` 停止并移除对应启动项。程序二进制、原始 TOML、配置快照和历史日志保留，方便重新安装或排查。正常停止会撤回本实例发布的环境变量；强制终止或断电无法保证立即清理，下次运行会根据记录恢复清理。
+`service uninstall` 停止并移除对应启动项。`~/.codex-app-server-bridge` 中的程序副本、`config.toml`（或自定义配置文件）、配置快照和历史日志保留，方便重新安装或排查。正常停止会撤回本实例发布的环境变量；强制终止或断电无法保证立即清理，下次运行会根据记录恢复清理。
 
 | 运行方式 | 日志 |
 | --- | --- |

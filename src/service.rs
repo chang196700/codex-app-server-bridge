@@ -35,6 +35,16 @@ pub struct ServiceOptions {
     pub state_dir: PathBuf,
 }
 
+pub fn installed_executable(user_home: &Path) -> PathBuf {
+    user_home
+        .join(".codex-app-server-bridge")
+        .join(if cfg!(windows) {
+            "codex-app-server-bridge.exe"
+        } else {
+            "codex-app-server-bridge"
+        })
+}
+
 pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
     for path in [
         &options.executable,
@@ -50,12 +60,218 @@ pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
         path_text(path)?;
     }
     if action == Action::Install {
-        if !options.executable.is_file() || !options.config_path.is_file() {
-            bail!("service executable and configuration snapshot must exist before installation");
+        if !std::env::current_exe()?.is_file() || !options.config_path.is_file() {
+            bail!("source executable and configuration snapshot must exist before installation");
+        }
+        if options.executable != installed_executable(&options.user_home) {
+            bail!(
+                "services must use the installed executable in the target user's configuration directory"
+            );
         }
         std::fs::create_dir_all(&options.state_dir).context("create service state directory")?;
     }
     platform::manage(action, options)
+}
+
+/// Owns staged files until service registration succeeds. Only platform code
+/// decides when the running service has stopped and replacement is safe.
+struct ExecutableInstall {
+    destination: PathBuf,
+    staged: Option<PathBuf>,
+    backup: Option<PathBuf>,
+    applied: bool,
+    _lock: std::fs::File,
+}
+
+impl ExecutableInstall {
+    fn stage(options: &ServiceOptions) -> Result<Self> {
+        let directory = options
+            .executable
+            .parent()
+            .context("installed executable has no directory")?;
+        if !directory.is_dir()
+            || std::fs::symlink_metadata(directory)?
+                .file_type()
+                .is_symlink()
+        {
+            bail!("installation directory must already exist and must not be a symbolic link");
+        }
+        let lock_path = directory.join("install.lock");
+        if std::fs::symlink_metadata(&lock_path)
+            .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            bail!("installation lock must be a regular file");
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .context("another service installation is in progress")?;
+        #[cfg(unix)]
+        if options.scope == Scope::System {
+            checked(
+                std::process::Command::new("chown")
+                    .arg(user_id(system_username(options)?)?.to_string())
+                    .arg(&lock_path),
+            )?;
+        }
+        let source =
+            std::fs::canonicalize(std::env::current_exe()?).context("locate source executable")?;
+        let mut install = Self {
+            destination: options.executable.clone(),
+            staged: None,
+            backup: None,
+            applied: false,
+            _lock: lock,
+        };
+        let old_exists = match std::fs::symlink_metadata(&options.executable) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => bail!("installed executable must be a regular file, not a symbolic link"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if old_exists && source == std::fs::canonicalize(&options.executable)? {
+            // Reinstalling from the fixed copy must not replace this process's
+            // own mapped image on Windows. Its bytes already are the source.
+            return Ok(install);
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let prefix = format!(".bridge-install-{}-{nonce}", std::process::id());
+        let staged = directory.join(format!("{prefix}.new"));
+        copy_executable(&source, &staged, options)?;
+        install.staged = Some(staged);
+        if old_exists {
+            let backup = directory.join(format!("{prefix}.backup"));
+            copy_executable(&options.executable, &backup, options)?;
+            install.backup = Some(backup);
+        }
+        Ok(install)
+    }
+
+    fn apply(&mut self) -> Result<()> {
+        if let Some(staged) = &self.staged {
+            replace_executable(staged, &self.destination).context(
+                "replace installed executable; the old file was retained if replacement failed",
+            )?;
+            self.staged = None;
+            self.applied = true;
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if self.applied {
+            if let Some(backup) = &self.backup {
+                replace_executable(backup, &self.destination).with_context(|| {
+                    format!(
+                        "restore previous executable; recovery copy remains at {}",
+                        backup.display()
+                    )
+                })?;
+                self.backup = None;
+            } else {
+                std::fs::remove_file(&self.destination)?;
+            }
+            self.applied = false;
+        }
+        Ok(())
+    }
+
+    fn commit(mut self) {
+        self.applied = false;
+        if let Some(backup) = self.backup.take()
+            && let Err(error) = std::fs::remove_file(&backup)
+        {
+            tracing::warn!(path = %backup.display(), %error, "installation succeeded but old executable backup could not be removed");
+        }
+    }
+}
+
+impl Drop for ExecutableInstall {
+    fn drop(&mut self) {
+        if let Some(staged) = &self.staged {
+            let _ = std::fs::remove_file(staged);
+        }
+        if !self.applied
+            && let Some(backup) = &self.backup
+        {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+}
+
+fn copy_executable(source: &Path, destination: &Path, options: &ServiceOptions) -> Result<()> {
+    let mut input = std::fs::File::open(source)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = (|| -> Result<()> {
+        let expected_length = input.metadata()?.len();
+        let written = std::io::copy(&mut input, &mut output)?;
+        if written != expected_length || written == 0 {
+            bail!("source executable changed while being copied");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            if options.scope == Scope::System {
+                checked(
+                    std::process::Command::new("chown")
+                        .arg(user_id(system_username(options)?)?.to_string())
+                        .arg(destination),
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = options;
+        output.sync_all()?;
+        Ok(())
+    })();
+    drop(output);
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    result.with_context(|| format!("copy executable to {}", destination.display()))
+}
+
+fn replace_executable(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::fs::rename(source, destination) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // SCM can report Stopped shortly before the process releases
+                    // its executable image. Never delete the old file first.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, destination)?;
+        Ok(())
+    }
+}
+
+fn installation_failure(error: anyhow::Error, recovery: Result<()>) -> anyhow::Error {
+    match recovery {
+        Ok(()) => error.context("installation failed; previous executable/service registration restored where present (the configuration snapshot is not rolled back)"),
+        Err(recovery) => error.context(format!("installation failed and recovery was incomplete: {recovery:#}")),
+    }
 }
 
 fn path_text(path: &Path) -> Result<&str> {
@@ -120,6 +336,14 @@ fn checked(command: &mut std::process::Command) -> Result<std::process::Output> 
 
 #[cfg(unix)]
 fn check_managed(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        bail!(
+            "service definition must be a regular file: {}",
+            path.display()
+        );
+    }
     match std::fs::read_to_string(path) {
         Ok(content) if !content.contains(MANAGED_MARKER) => {
             bail!(
@@ -130,6 +354,29 @@ fn check_managed(path: &Path) -> Result<()> {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn previous_definition(path: &Path) -> Result<Option<String>> {
+    check_managed(path)?;
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn restore_definition(path: &Path, previous: Option<&str>) -> Result<()> {
+    if let Some(previous) = previous {
+        write_managed(path, previous)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -332,6 +579,43 @@ mod platform {
         let name = format!("{SERVICE_NAME}.service");
         match action {
             Action::Install => {
+                let previous = previous_definition(&path)?;
+                let inspection = systemctl(options.scope)
+                    .args([
+                        "show",
+                        &name,
+                        "--property=FragmentPath",
+                        "--property=LoadState",
+                        "--property=ActiveState",
+                        "--property=UnitFileState",
+                    ])
+                    .output()
+                    .context("inspect existing systemd service")?;
+                let properties = String::from_utf8(inspection.stdout)?;
+                let property =
+                    |key: &str| properties.lines().find_map(|line| line.strip_prefix(key));
+                if !inspection.status.success() && property("LoadState=") != Some("not-found") {
+                    bail!(
+                        "cannot inspect existing systemd service: {}",
+                        String::from_utf8_lossy(&inspection.stderr)
+                    );
+                }
+                if let Some(fragment) = property("FragmentPath=").filter(|value| !value.is_empty())
+                    && (previous.is_none()
+                        || std::fs::canonicalize(fragment)? != std::fs::canonicalize(&path)?)
+                {
+                    bail!(
+                        "refusing to replace an unmanaged systemd service loaded from {fragment}"
+                    );
+                }
+                let was_running = matches!(
+                    property("ActiveState="),
+                    Some("active" | "activating" | "reloading")
+                );
+                let was_enabled = matches!(
+                    property("UnitFileState="),
+                    Some("enabled" | "enabled-runtime")
+                );
                 let identity = if options.scope == Scope::System {
                     let username = system_username(options)?;
                     prepare_system_files(options, username)?;
@@ -361,11 +645,44 @@ mod platform {
                         false
                     ),
                 );
-                write_managed(&path, &content)?;
-                checked(systemctl(options.scope).arg("daemon-reload"))?;
-                checked(systemctl(options.scope).args(["enable", &name]))?;
-                checked(systemctl(options.scope).args(["restart", &name]))?;
-                println!("Installed and started {}", path.display());
+                let mut executable = ExecutableInstall::stage(options)?;
+                let mut registration_changed = false;
+                let result = (|| -> Result<()> {
+                    if previous.is_some() {
+                        checked(systemctl(options.scope).args(["stop", &name]))?;
+                    }
+                    executable.apply()?;
+                    write_managed(&path, &content)?;
+                    registration_changed = true;
+                    checked(systemctl(options.scope).arg("daemon-reload"))?;
+                    checked(systemctl(options.scope).args(["enable", &name]))?;
+                    checked(systemctl(options.scope).args(["start", &name]))?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let recovery = (|| -> Result<()> {
+                        if registration_changed {
+                            checked(systemctl(options.scope).args(["stop", &name]))?;
+                            if !was_enabled {
+                                checked(systemctl(options.scope).args(["disable", &name]))?;
+                            }
+                        }
+                        executable.rollback()?;
+                        restore_definition(&path, previous.as_deref())?;
+                        checked(systemctl(options.scope).arg("daemon-reload"))?;
+                        if was_running {
+                            checked(systemctl(options.scope).args(["start", &name]))?;
+                        }
+                        Ok(())
+                    })();
+                    return Err(installation_failure(error, recovery));
+                }
+                executable.commit();
+                println!(
+                    "Installed {} and started {}",
+                    options.executable.display(),
+                    path.display()
+                );
                 if options.scope == Scope::User {
                     println!(
                         "For startup before login, enable lingering for this user with loginctl enable-linger."
@@ -461,6 +778,11 @@ mod platform {
         let target = format!("{domain}/{LABEL}");
         match action {
             Action::Install => {
+                let previous = previous_definition(&path)?;
+                let was_loaded = loaded(&target)?;
+                if was_loaded && previous.is_none() {
+                    bail!("refusing to replace an unmanaged launchd job {target}");
+                }
                 let identity = if options.scope == Scope::System {
                     let username = system_username(options)?;
                     prepare_system_files(options, username)?;
@@ -488,18 +810,47 @@ mod platform {
                     xml(path_text(&options.state_dir.join("service.stdout.log"))?),
                     xml(path_text(&options.state_dir.join("service.stderr.log"))?),
                 );
-                write_managed(&path, &content)?;
-                if loaded(&target)? {
-                    bootout(&target, options)?;
+                let mut executable = ExecutableInstall::stage(options)?;
+                let result = (|| -> Result<()> {
+                    if was_loaded {
+                        bootout(&target, options)?;
+                    }
+                    executable.apply()?;
+                    write_managed(&path, &content)?;
+                    checked(Command::new("launchctl").args(["enable", &target]))?;
+                    checked(
+                        Command::new("launchctl")
+                            .arg("bootstrap")
+                            .arg(&domain)
+                            .arg(&path),
+                    )?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let recovery = (|| -> Result<()> {
+                        if loaded(&target)? {
+                            bootout(&target, options)?;
+                        }
+                        executable.rollback()?;
+                        restore_definition(&path, previous.as_deref())?;
+                        if was_loaded {
+                            checked(
+                                Command::new("launchctl")
+                                    .arg("bootstrap")
+                                    .arg(&domain)
+                                    .arg(&path),
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    return Err(installation_failure(error, recovery));
                 }
-                checked(Command::new("launchctl").args(["enable", &target]))?;
-                checked(
-                    Command::new("launchctl")
-                        .arg("bootstrap")
-                        .arg(&domain)
-                        .arg(&path),
-                )?;
-                println!("Installed and started {}", path.display());
+                executable.commit();
+                println!(
+                    "Installed {} and started {}",
+                    options.executable.display(),
+                    path.display()
+                );
             }
             Action::Uninstall => {
                 check_managed(&path)?;
@@ -738,35 +1089,101 @@ mod platform {
                 account_password: None,
             };
             let access = ServiceAccess::QUERY_STATUS
+                | ServiceAccess::QUERY_CONFIG
                 | ServiceAccess::CHANGE_CONFIG
                 | ServiceAccess::START
-                | ServiceAccess::STOP;
-            let service = match manager.open_service(SERVICE_NAME, access) {
-                Ok(service) => {
-                    stop_service(&service)?;
-                    service.change_config(&info)?;
-                    service
-                }
-                Err(error) if missing_service(&error) => manager.create_service(&info, access)?,
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE;
+            let mut service = match manager.open_service(SERVICE_NAME, access) {
+                Ok(service) => Some(service),
+                Err(error) if missing_service(&error) => None,
                 Err(error) => return Err(error.into()),
             };
-            service.set_description(
-                "Bridges the Codex app-server control socket to a local WebSocket endpoint.",
-            )?;
-            service.set_delayed_auto_start(true)?;
-            service.update_failure_actions(ServiceFailureActions {
-                reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
-                reboot_msg: None,
-                command: None,
-                actions: Some(vec![ServiceAction {
-                    action_type: ServiceActionType::Restart,
-                    delay: Duration::from_secs(5),
-                }]),
-            })?;
-            service.set_failure_actions_on_non_crash_failures(true)?;
-            service.start::<&OsStr>(&[])?;
-            wait_for(&service, ServiceState::Running)?;
-            println!("Installed and started Windows service {SERVICE_NAME}");
+            let previous = if let Some(service) = &service {
+                let config = service.query_config()?;
+                if config.display_name != OsStr::new("Codex app-server WebSocket bridge")
+                    || config.service_type != ServiceType::OWN_PROCESS
+                {
+                    bail!("refusing to modify an unmanaged Windows service {SERVICE_NAME}");
+                }
+                let command =
+                    managed_command(path_text(&config.executable_path)?, options, "service-run")?;
+                Some(ServiceInfo {
+                    name: SERVICE_NAME.into(),
+                    display_name: config.display_name,
+                    service_type: config.service_type,
+                    start_type: config.start_type,
+                    error_control: config.error_control,
+                    executable_path: PathBuf::from(&command[0]),
+                    launch_arguments: command[1..].to_vec(),
+                    dependencies: config.dependencies,
+                    account_name: config.account_name,
+                    account_password: None,
+                })
+            } else {
+                None
+            };
+            let was_running = if let Some(service) = &service {
+                service.query_status()?.current_state != ServiceState::Stopped
+            } else {
+                false
+            };
+            let mut executable = ExecutableInstall::stage(options)?;
+            let result = (|| -> Result<()> {
+                if let Some(service) = &service {
+                    stop_service(service)?;
+                }
+                executable.apply()?;
+                if let Some(service) = &service {
+                    service.change_config(&info)?;
+                } else {
+                    service = Some(manager.create_service(&info, access)?);
+                }
+                let service = service.as_ref().context("missing installed service")?;
+                service.set_description(
+                    "Bridges the Codex app-server control socket to a local WebSocket endpoint.",
+                )?;
+                service.set_delayed_auto_start(true)?;
+                service.update_failure_actions(ServiceFailureActions {
+                    reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+                    reboot_msg: None,
+                    command: None,
+                    actions: Some(vec![ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(5),
+                    }]),
+                })?;
+                service.set_failure_actions_on_non_crash_failures(true)?;
+                service.start::<&OsStr>(&[])?;
+                wait_for(service, ServiceState::Running)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let recovery = (|| -> Result<()> {
+                    if let Some(service) = &service {
+                        stop_service(service)?;
+                    }
+                    executable.rollback()?;
+                    if let Some(service) = &service {
+                        if let Some(previous) = &previous {
+                            service.change_config(previous)?;
+                            if was_running {
+                                service.start::<&OsStr>(&[])?;
+                                wait_for(service, ServiceState::Running)?;
+                            }
+                        } else {
+                            service.delete()?;
+                        }
+                    }
+                    Ok(())
+                })();
+                return Err(installation_failure(error, recovery));
+            }
+            executable.commit();
+            println!(
+                "Installed {} and started Windows service {SERVICE_NAME}",
+                options.executable.display()
+            );
             return Ok(());
         }
         let access = match action {
@@ -850,11 +1267,93 @@ mod platform {
         quoted
     }
 
+    fn managed_command(
+        command: &str,
+        options: &ServiceOptions,
+        subcommand: &str,
+    ) -> Result<Vec<OsString>> {
+        let characters: Vec<char> = command.chars().collect();
+        let mut index = 0;
+        let mut arguments = Vec::new();
+        while index < characters.len() {
+            while index < characters.len() && characters[index].is_whitespace() {
+                index += 1;
+            }
+            if index == characters.len() {
+                break;
+            }
+            let mut argument = String::new();
+            let mut quoted = false;
+            while index < characters.len() && (quoted || !characters[index].is_whitespace()) {
+                let mut slashes = 0;
+                while index < characters.len() && characters[index] == '\\' {
+                    slashes += 1;
+                    index += 1;
+                }
+                if index < characters.len() && characters[index] == '"' {
+                    argument.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 0 {
+                        quoted = !quoted;
+                    } else {
+                        argument.push('"');
+                    }
+                    index += 1;
+                } else {
+                    argument.extend(std::iter::repeat_n('\\', slashes));
+                    if index < characters.len() && (quoted || !characters[index].is_whitespace()) {
+                        argument.push(characters[index]);
+                        index += 1;
+                    }
+                }
+            }
+            if quoted {
+                bail!("refusing to modify a service with an unrecognized command line");
+            }
+            arguments.push(argument);
+        }
+        if arguments.len() != 4
+            || !Path::new(&arguments[0]).is_absolute()
+            || arguments[1] != "--config"
+            || arguments[3] != subcommand
+        {
+            bail!("refusing to modify an unmanaged service command: {command}");
+        }
+        let previous_config =
+            std::fs::canonicalize(&arguments[2]).unwrap_or_else(|_| PathBuf::from(&arguments[2]));
+        let expected_config = std::fs::canonicalize(&options.config_path)?;
+        if !previous_config
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected_config.to_string_lossy())
+        {
+            bail!(
+                "existing service uses a different configuration snapshot: {}",
+                arguments[2]
+            );
+        }
+        Ok(arguments.into_iter().map(OsString::from).collect())
+    }
+
+    fn current_autostart(current_user: &RegKey) -> Result<Option<String>> {
+        match current_user.open_subkey_with_flags(RUN_KEY, KEY_READ) {
+            Ok(key) => match key.get_value(SERVICE_NAME) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn manage_autostart(action: Action, options: &ServiceOptions) -> Result<()> {
         let current_user = RegKey::predef(HKEY_CURRENT_USER);
         match action {
             Action::Install => {
-                let (key, _) = current_user.create_subkey(RUN_KEY)?;
+                let previous = current_autostart(&current_user)?;
+                let previous_arguments = previous
+                    .as_deref()
+                    .map(|command| managed_command(command, options, "hidden-start"))
+                    .transpose()?;
                 let mut args = vec![options.executable.as_os_str().to_owned()];
                 args.extend(arguments(options, "hidden-start"));
                 let command = args
@@ -867,13 +1366,53 @@ mod platform {
                 // The Windows Run registry key has a documented 260-character limit.
                 if command.encode_utf16().count() > 260 {
                     bail!(
-                        "Windows login startup command exceeds 260 characters; use shorter executable/config paths or --scope system"
+                        "Windows login startup command exceeds 260 characters; use a shorter target home/config path or --scope system"
                     );
                 }
-                stop_autostart(options)?;
-                key.set_value(SERVICE_NAME, &command)?;
-                start_autostart(options)?;
-                println!("Installed current-user login startup entry {SERVICE_NAME}");
+                let was_running = autostart_running(options)?;
+                if was_running && previous.is_none() {
+                    bail!("stop the foreground bridge before installing a new login startup entry");
+                }
+                let mut executable = ExecutableInstall::stage(options)?;
+                let (key, _) = current_user.create_subkey(RUN_KEY)?;
+                let result = (|| -> Result<()> {
+                    stop_autostart(options)?;
+                    executable.apply()?;
+                    key.set_value(SERVICE_NAME, &command)?;
+                    start_autostart(options)?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let recovery = (|| -> Result<()> {
+                        stop_autostart(options)?;
+                        executable.rollback()?;
+                        if let Some(previous) = &previous {
+                            key.set_value(SERVICE_NAME, previous)?;
+                        } else {
+                            match key.delete_value(SERVICE_NAME) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                        if was_running {
+                            let mut old_options = options.clone();
+                            let previous_arguments = previous_arguments
+                                .as_ref()
+                                .context("missing previous startup arguments")?;
+                            old_options.executable = PathBuf::from(&previous_arguments[0]);
+                            old_options.config_path = PathBuf::from(&previous_arguments[2]);
+                            start_autostart(&old_options)?;
+                        }
+                        Ok(())
+                    })();
+                    return Err(installation_failure(error, recovery));
+                }
+                executable.commit();
+                println!(
+                    "Installed {} and current-user login startup entry {SERVICE_NAME}",
+                    options.executable.display()
+                );
             }
             Action::Uninstall => {
                 match current_user.open_subkey_with_flags(RUN_KEY, KEY_WRITE) {

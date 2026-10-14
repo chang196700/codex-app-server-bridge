@@ -1,5 +1,6 @@
 mod bridge;
 mod config;
+mod config_command;
 mod environment;
 mod service;
 mod socket;
@@ -19,7 +20,7 @@ use std::{
     about = "Monitor Codex's control socket and expose a local WebSocket endpoint"
 )]
 struct Cli {
-    /// TOML config file (default: ~/.codex-app-server-bridge)
+    /// TOML config file (default: ~/.codex-app-server-bridge/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Target user's home; useful when installing a system service
@@ -43,6 +44,11 @@ enum Command {
     Status,
     /// Create an example TOML configuration (never overwrites an existing file)
     InitConfig,
+    /// List, read, or update configuration options
+    Config {
+        #[command(subcommand)]
+        action: config_command::Action,
+    },
     /// Install or manage OS services / login startup
     Service {
         #[arg(value_enum)]
@@ -113,23 +119,22 @@ fn run(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::Config { action }) = &cli.command {
+        return config_command::run(action, cli.config.as_deref(), cli.user_home.as_deref());
+    }
     if matches!(cli.command, Some(Command::InitConfig)) {
-        let home = cli
-            .user_home
-            .or_else(dirs::home_dir)
-            .context("cannot determine user home")?;
-        let path = config::absolute(
-            cli.config
-                .as_deref()
-                .unwrap_or(&home.join(".codex-app-server-bridge")),
-            &home,
-        )?;
+        let path = config::resolve_config_path(cli.config.as_deref(), cli.user_home.as_deref())?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            config::private_dir(parent)?;
         }
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
             .open(&path)
             .with_context(|| {
                 format!(
@@ -171,7 +176,7 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run(settings, None),
         Command::Status => bridge::show_status(&settings),
-        Command::InitConfig => unreachable!(),
+        Command::InitConfig | Command::Config { .. } => unreachable!(),
         Command::Service {
             action,
             scope,
@@ -188,8 +193,21 @@ fn main() -> Result<()> {
             }
             let snapshot = settings.state_dir.join("service.toml");
             if matches!(action, service::Action::Install) {
+                // The stable executable always lives in the selected user's
+                // default directory, even when --config selects another file.
+                let default_config = config::resolve_config_path(None, Some(&settings.user_home))?;
+                let install_directory = default_config
+                    .parent()
+                    .context("default configuration has no parent directory")?;
                 #[cfg(unix)]
                 if matches!(scope, service::Scope::System) {
+                    service::prepare_install_directory(
+                        install_directory,
+                        &settings.user_home,
+                        username
+                            .as_deref()
+                            .context("system install requires --username")?,
+                    )?;
                     service::prepare_install_directory(
                         &settings.state_dir,
                         &settings.user_home,
@@ -198,6 +216,7 @@ fn main() -> Result<()> {
                             .context("system install requires --username")?,
                     )?;
                 }
+                config::private_dir(install_directory)?;
                 config::private_dir(&settings.state_dir)?;
                 if settings.config.windows_user_sid.is_none() {
                     settings.config.windows_user_sid = environment::current_user_sid()?;
@@ -210,7 +229,7 @@ fn main() -> Result<()> {
             let options = service::ServiceOptions {
                 scope,
                 username,
-                executable: std::env::current_exe()?,
+                executable: service::installed_executable(&settings.user_home),
                 config_path: snapshot,
                 user_home: settings.user_home,
                 codex_home: settings.codex_home,
