@@ -58,7 +58,7 @@ poll_interval_ms = 2000         # socket 健康检查间隔，至少 100 毫秒
 connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
 max_connections = 64
 max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
-publish_environment = false    # 自动设置用户环境变量，默认关闭；设为 true 开启
+publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 true 自动设置用户环境变量
 
 # 必须使用本程序专用的状态目录
 # state_dir = "~/.local/state/codex-app-server-bridge"
@@ -78,12 +78,14 @@ publish_environment = false    # 自动设置用户环境变量，默认关闭�
 
 ## 环境变量如何生效
 
-自动设置环境变量**默认关闭**，省略 `publish_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
+自动设置环境变量**默认关闭**，省略 `publish_codex_app_server_ws_url_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
+
+已有配置若使用旧名称 `publish_environment`，请将其替换为 `publish_codex_app_server_ws_url_environment`；已安装的服务还需重新运行 `service install` 更新配置快照。
 
 需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge` 中开启：
 
 ```toml
-publish_environment = true
+publish_codex_app_server_ws_url_environment = true
 ```
 
 修改后重启前台进程；已安装服务则重新运行相同的 `service install` 命令，使配置快照更新并重启。要关闭已开启的发布功能，先停止原进程，让它清理自己发布的变量，再设为 `false` 并启动或重新安装服务。

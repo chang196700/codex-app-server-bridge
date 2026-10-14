@@ -185,7 +185,7 @@ async fn environment_worker(
     url: String,
     mut desired: watch::Receiver<bool>,
 ) -> Result<()> {
-    if !settings.config.publish_environment {
+    if !settings.config.publish_codex_app_server_ws_url_environment {
         return Ok(());
     }
     let mut publisher = Publisher::new(
