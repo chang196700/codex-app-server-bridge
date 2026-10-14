@@ -23,6 +23,42 @@ Pushing to `main` automatically runs [release-plz](https://release-plz.dev/) to 
 
 The workflow uses the built-in `GITHUB_TOKEN`; no additional secrets are required. `main` must allow the workflow's version commit. Its token-generated push does not start another workflow. Releases run serially; queued runs use the latest `main`, so closely spaced pushes can be included in one release. To retry an interrupted release, rerun the failed jobs or manually run the **Release** workflow on `main`. Existing tags keep their original source, and complete releases are not overwritten. Build failures leave the version commit on `main`, without publishing an incomplete release.
 
+## Update from GitHub
+
+```sh
+# Update the installed user service or login startup binary
+codex-app-server-bridge update
+
+# Update only the executable running this command
+codex-app-server-bridge update --self
+
+# Locate a service installed with a custom configuration / state directory
+codex-app-server-bridge --config /path/to/bridge.toml update
+```
+
+`update` checks the operating system's service or startup registration and updates the fixed executable under the selected user's `~/.codex-app-server-bridge` directory. If the service is not installed, it reports an error; a binary left behind by `service uninstall` does not count as an installation. The default scope is `user`.
+
+The command reads the installed binary's version and downloads the latest stable GitHub Release for the updater's operating system and architecture. On Linux, a GNU updater selects the GNU/glibc archive and a musl updater selects the musl archive. It verifies the archive against the release's `SHA256SUMS` before replacing any executable. If the target version is already equal to or newer than the latest release, it leaves the target unchanged.
+
+Service updates preserve the startup registration and `<state_dir>/service.toml` configuration snapshot. A running service is stopped only after the download is validated, then restarted with the new binary; a stopped service remains stopped. If replacement or restart fails, the updater attempts to restore the previous binary and service state. To apply configuration changes as well, rerun `service install` afterward. Use the same `--user-home` and `--config` selection as the installation when locating a custom service.
+
+For a Linux or macOS system service, supply the target username and home directory with the required administrator privileges:
+
+```sh
+# Linux; on macOS, use /Users/alice for the user's home directory
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge \
+  --user-home /home/alice update --scope system --username alice
+```
+
+For a Windows system service, run an elevated PowerShell session belonging to the target user:
+
+```powershell
+& 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe' `
+  --user-home 'C:\Users\alice' update --scope system
+```
+
+`update --self` replaces the executable used to invoke the command. It does not load configuration, require an installed service, or stop or restart a service, and cannot be combined with `--scope` or `--username`. It requires write access to the executable's directory. If you invoke it from the fixed service executable, that file is replaced, but an already running service keeps using its existing process until restarted. Use `update` to apply the new version to a running service automatically.
+
 ## Build and run
 
 Install Rust / rustup and the native Rust build tools for your platform. The repository's `rust-toolchain.toml` specifies the toolchain version.
@@ -161,9 +197,9 @@ Native Windows services run in Session 0, so their environment change broadcasts
 
 ## Install a service or enable startup
 
-`service install` copies the current executable to `~/.codex-app-server-bridge/codex-app-server-bridge` (`codex-app-server-bridge.exe` on Windows), under the selected user's home directory, and registers this stable path for startup. You can install directly from a build or download directory and remove that source copy afterward. Keep the installed copy while the service or startup entry is in use. To upgrade, run the same `service install` command using the new executable; installation refreshes the installed copy and configuration snapshot and restarts the instance.
+`service install` copies the current executable to `~/.codex-app-server-bridge/codex-app-server-bridge` (`codex-app-server-bridge.exe` on Windows), under the selected user's home directory, and registers this stable path for startup. You can install directly from a build or download directory and remove that source copy afterward. Keep the installed copy while the service or startup entry is in use. Use [`update`](#update-from-github) to upgrade the service from GitHub while retaining its configuration snapshot. You can also run the same `service install` command using a new executable; installation refreshes both the installed copy and configuration snapshot and restarts the instance.
 
-The installation directory follows the selected `user_home`, regardless of where `--config` points. Installation does not add the directory to `PATH`; use the installed executable's full path for later commands if needed. Running `service install` from the installed copy skips copying the executable onto itself and updates the configuration and startup registration. To install a newer version, run `service install` from the new build or download instead.
+The installation directory follows the selected `user_home`, regardless of where `--config` points. Installation does not add the directory to `PATH`; use the installed executable's full path for later commands if needed. Running `service install` from the installed copy skips copying the executable onto itself and updates the configuration and startup registration. The installed copy can fetch a newer version with `update`.
 
 `service install` registers and immediately starts the service or startup entry. Running it again updates the configuration and restarts the instance. Installation saves the effective configuration to `<state_dir>/service.toml`, which the background process reads. Changes to the original configuration, port, or `CODEX_HOME` require another `service install` to take effect; `service start` alone does not regenerate the snapshot. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
 

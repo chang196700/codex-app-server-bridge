@@ -11,23 +11,35 @@ publish = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.28"
-toml = "0.8"
-toml_edit = "0.22"
+tokio-tungstenite = "0.30"
+toml = "1"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webpki-roots = "1"
+
+[target.'cfg(unix)'.dependencies]
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+self-replace = "1.5"
 socket2 = { version = "0.6", features = ["all"] }
 windows-service = "0.8"
-winreg = "0.55"
+winreg = "0.56"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
 lto = "thin"

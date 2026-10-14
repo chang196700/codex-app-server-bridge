@@ -4,6 +4,8 @@ mod config_command;
 mod environment;
 mod service;
 mod socket;
+mod update;
+mod update_replace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -56,6 +58,17 @@ enum Command {
         #[arg(long, value_enum, default_value = "user")]
         scope: service::Scope,
         /// Required for Linux/macOS system services: run as this account
+        #[arg(long)]
+        username: Option<String>,
+    },
+    /// Update the installed service binary from the latest GitHub Release
+    Update {
+        /// Update this executable instead, without managing a service
+        #[arg(long = "self", conflicts_with_all = ["scope", "username"])]
+        update_self: bool,
+        #[arg(long, value_enum, default_value = "user")]
+        scope: service::Scope,
+        /// Required for Linux/macOS system services: the installed service account
         #[arg(long)]
         username: Option<String>,
     },
@@ -122,6 +135,16 @@ fn main() -> Result<()> {
     if let Some(Command::Config { action }) = &cli.command {
         return config_command::run(action, cli.config.as_deref(), cli.user_home.as_deref());
     }
+    if matches!(
+        cli.command,
+        Some(Command::Update {
+            update_self: true,
+            ..
+        })
+    ) {
+        init_stderr_logging();
+        return update::run(None);
+    }
     if matches!(cli.command, Some(Command::InitConfig)) {
         let path = config::resolve_config_path(cli.config.as_deref(), cli.user_home.as_deref())?;
         if let Some(parent) = path.parent() {
@@ -177,6 +200,27 @@ fn main() -> Result<()> {
         Command::Run => run(settings, None),
         Command::Status => bridge::show_status(&settings),
         Command::InitConfig | Command::Config { .. } => unreachable!(),
+        Command::Update {
+            scope, username, ..
+        } => {
+            #[cfg(unix)]
+            if matches!(scope, service::Scope::System)
+                && (username.is_none() || cli.user_home.is_none())
+            {
+                anyhow::bail!(
+                    "system service updates require --username and an explicit --user-home for the target user"
+                );
+            }
+            update::run(Some(&service::ServiceOptions {
+                scope,
+                username,
+                executable: service::installed_executable(&settings.user_home),
+                config_path: settings.state_dir.join("service.toml"),
+                user_home: settings.user_home,
+                codex_home: settings.codex_home,
+                state_dir: settings.state_dir,
+            }))
+        }
         Command::Service {
             action,
             scope,

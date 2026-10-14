@@ -46,19 +46,7 @@ pub fn installed_executable(user_home: &Path) -> PathBuf {
 }
 
 pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
-    for path in [
-        &options.executable,
-        &options.config_path,
-        &options.user_home,
-        &options.codex_home,
-        &options.state_dir,
-    ] {
-        if !path.is_absolute() {
-            bail!("service paths must be absolute: {}", path.display());
-        }
-        // Services serialize paths to UTF-8 configuration files and command lines.
-        path_text(path)?;
-    }
+    validate_paths(options)?;
     if action == Action::Install {
         if !std::env::current_exe()?.is_file() || !options.config_path.is_file() {
             bail!("source executable and configuration snapshot must exist before installation");
@@ -73,6 +61,125 @@ pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
     platform::manage(action, options)
 }
 
+fn validate_paths(options: &ServiceOptions) -> Result<()> {
+    for path in [
+        &options.executable,
+        &options.config_path,
+        &options.user_home,
+        &options.codex_home,
+        &options.state_dir,
+    ] {
+        if !path.is_absolute() {
+            bail!("service paths must be absolute: {}", path.display());
+        }
+        // Services serialize paths to UTF-8 configuration files and command lines.
+        path_text(path)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InstalledService {
+    pub running: bool,
+}
+
+/// Inspect OS registration, not just the executable retained after uninstall.
+/// An existing registration for a different executable/snapshot is an error.
+pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+    validate_paths(options)?;
+    if options.executable != installed_executable(&options.user_home) {
+        bail!("service updates must target the fixed installed executable");
+    }
+    platform::inspect_installed(options)
+}
+
+/// Install an already downloaded and verified executable without changing the
+/// registered service definition or its configuration snapshot.
+pub fn update_binary(
+    options: &ServiceOptions,
+    candidate: &Path,
+    expected_version: &semver::Version,
+) -> Result<()> {
+    inspect_installed(options)?.context("service is not installed; run `service install` first")?;
+    let mut executable = ExecutableInstall::stage_from(options, candidate)?;
+    crate::update::ensure_version(&options.executable, expected_version)?;
+    // Recheck while holding the same lock used by service installation, after
+    // download/verification and staging have completed.
+    let previous =
+        inspect_installed(options)?.context("service is no longer installed; update cancelled")?;
+    let result = (|| -> Result<()> {
+        if previous.running {
+            platform::manage(Action::Stop, options)?;
+        }
+        executable.apply()?;
+        if previous.running {
+            let old_pid = status_pid(options);
+            platform::manage(Action::Start, options)?;
+            wait_for_runtime(options, old_pid)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let recovery = (|| -> Result<()> {
+            if previous.running {
+                platform::manage(Action::Stop, options)?;
+            }
+            executable.rollback()?;
+            if previous.running {
+                let old_pid = status_pid(options);
+                platform::manage(Action::Start, options)?;
+                wait_for_runtime(options, old_pid)?;
+            }
+            Ok(())
+        })();
+        return Err(match recovery {
+            Ok(()) => error
+                .context("service update failed; previous executable and running state restored"),
+            Err(recovery) => error.context(format!(
+                "service update failed and recovery was incomplete: {recovery:#}"
+            )),
+        });
+    }
+    executable.commit();
+    Ok(())
+}
+
+fn status_pid(options: &ServiceOptions) -> Option<u64> {
+    let bytes = std::fs::read(options.state_dir.join("status.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("pid")?
+        .as_u64()
+}
+
+fn wait_for_runtime(options: &ServiceOptions, old_pid: Option<u64>) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        // The runtime writes its PID only after binding its TCP listener. The
+        // instance lock alone is acquired earlier and does not confirm startup.
+        if runtime_running(options)? && status_pid(options).is_some_and(|pid| Some(pid) != old_pid)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "updated service did not finish startup within 15 seconds; inspect {}",
+                options.state_dir.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn same_path(actual: &Path, expected: &Path) -> Result<bool> {
+    let actual = std::fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
+    let expected = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    #[cfg(windows)]
+    return Ok(path_text(&actual)?.eq_ignore_ascii_case(path_text(&expected)?));
+    #[cfg(not(windows))]
+    Ok(actual == expected)
+}
+
 /// Owns staged files until service registration succeeds. Only platform code
 /// decides when the running service has stopped and replacement is safe.
 struct ExecutableInstall {
@@ -80,11 +187,17 @@ struct ExecutableInstall {
     staged: Option<PathBuf>,
     backup: Option<PathBuf>,
     applied: bool,
+    #[cfg(windows)]
+    parked_self: Option<PathBuf>,
     _lock: std::fs::File,
 }
 
 impl ExecutableInstall {
     fn stage(options: &ServiceOptions) -> Result<Self> {
+        Self::stage_from(options, &std::env::current_exe()?)
+    }
+
+    fn stage_from(options: &ServiceOptions, source: &Path) -> Result<Self> {
         let directory = options
             .executable
             .parent()
@@ -118,13 +231,14 @@ impl ExecutableInstall {
                     .arg(&lock_path),
             )?;
         }
-        let source =
-            std::fs::canonicalize(std::env::current_exe()?).context("locate source executable")?;
+        let source = std::fs::canonicalize(source).context("locate source executable")?;
         let mut install = Self {
             destination: options.executable.clone(),
             staged: None,
             backup: None,
             applied: false,
+            #[cfg(windows)]
+            parked_self: None,
             _lock: lock,
         };
         let old_exists = match std::fs::symlink_metadata(&options.executable) {
@@ -155,6 +269,18 @@ impl ExecutableInstall {
 
     fn apply(&mut self) -> Result<()> {
         if let Some(staged) = &self.staged {
+            #[cfg(windows)]
+            if same_path(&std::env::current_exe()?, &self.destination)? {
+                // Windows permits renaming a mapped image but not overwriting
+                // it. Keep the updater's own image alive under a unique sibling
+                // name until this process exits, with rollback still available.
+                let parked = staged.with_extension("running.exe");
+                std::fs::rename(&self.destination, &parked).context(
+                    "move the running updater aside before replacing the service executable",
+                )?;
+                self.parked_self = Some(parked);
+                self.applied = true;
+            }
             replace_executable(staged, &self.destination).context(
                 "replace installed executable; the old file was retained if replacement failed",
             )?;
@@ -166,6 +292,15 @@ impl ExecutableInstall {
 
     fn rollback(&mut self) -> Result<()> {
         if self.applied {
+            #[cfg(windows)]
+            if let Some(parked) = &self.parked_self {
+                replace_executable(parked, &self.destination).with_context(|| {
+                    format!("restore running updater from {}", parked.display())
+                })?;
+                self.parked_self = None;
+                self.applied = false;
+                return Ok(());
+            }
             if let Some(backup) = &self.backup {
                 replace_executable(backup, &self.destination).with_context(|| {
                     format!(
@@ -184,6 +319,12 @@ impl ExecutableInstall {
 
     fn commit(mut self) {
         self.applied = false;
+        #[cfg(windows)]
+        if let Some(parked) = self.parked_self.take()
+            && let Err(error) = self_replace::self_delete_at(&parked)
+        {
+            tracing::warn!(path = %parked.display(), %error, "update succeeded but the old updater image could not be scheduled for cleanup");
+        }
         if let Some(backup) = self.backup.take()
             && let Err(error) = std::fs::remove_file(&backup)
         {
@@ -294,7 +435,6 @@ fn arguments(options: &ServiceOptions, subcommand: &str) -> Vec<std::ffi::OsStri
     ]
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 fn runtime_running(options: &ServiceOptions) -> Result<bool> {
     let lock = match std::fs::OpenOptions::new()
         .read(true)
@@ -574,6 +714,79 @@ mod platform {
         command
     }
 
+    pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        let path = unit_path(options);
+        let Some(content) = previous_definition(&path)? else {
+            // No installation for this scope/home. In particular, do not need
+            // a running user manager just to report that nothing is installed.
+            return Ok(None);
+        };
+        let name = format!("{SERVICE_NAME}.service");
+        let output = systemctl(options.scope)
+            .args([
+                "show",
+                &name,
+                "--property=FragmentPath",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=DropInPaths",
+            ])
+            .output()
+            .context("inspect installed systemd service")?;
+        let properties = String::from_utf8(output.stdout)?;
+        let property = |key: &str| properties.lines().find_map(|line| line.strip_prefix(key));
+        if !output.status.success() {
+            bail!(
+                "cannot inspect installed systemd service: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if property("LoadState=") != Some("loaded") {
+            bail!(
+                "installed systemd service is not loadable; repair it with `service install` before updating"
+            );
+        }
+        let fragment = property("FragmentPath=").context("systemd returned no FragmentPath")?;
+        if !same_path(Path::new(fragment), &path)? {
+            bail!("refusing to update a systemd service loaded from another file: {fragment}");
+        }
+        if property("DropInPaths=").is_some_and(|value| !value.is_empty()) {
+            bail!(
+                "service has systemd drop-in overrides; remove overrides before updating so its executable and configuration can be verified"
+            );
+        }
+        let mut expected = vec![quote(path_text(&options.executable)?, true)];
+        expected.extend(arguments(options, "run").iter().map(|arg| {
+            quote(
+                arg.to_str().expect("validated Unicode service arguments"),
+                true,
+            )
+        }));
+        let commands = content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ExecStart="))
+            .collect::<Vec<_>>();
+        if commands != [expected.join(" ")] {
+            bail!("existing systemd service uses a different executable or configuration snapshot");
+        }
+        if options.scope == Scope::System {
+            let expected_user = user_id(system_username(options)?)?.to_string();
+            let users = content
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("User="))
+                .collect::<Vec<_>>();
+            if users != [expected_user] {
+                bail!("existing systemd service runs as a different user");
+            }
+        }
+        let running = match property("ActiveState=") {
+            Some("active" | "activating" | "reloading") => true,
+            Some("inactive" | "failed") => false,
+            state => bail!("systemd service is changing state ({state:?}); retry after it settles"),
+        };
+        Ok(Some(InstalledService { running }))
+    }
+
     fn stop_if_running(scope: Scope, name: &str) -> Result<()> {
         let output =
             checked(systemctl(scope).args(["show", name, "--property=ActiveState", "--value"]))?;
@@ -786,6 +999,81 @@ mod platform {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         Ok(())
+    }
+
+    pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        let directory = match options.scope {
+            Scope::User => options.user_home.join("Library/LaunchAgents"),
+            Scope::System => PathBuf::from("/Library/LaunchDaemons"),
+        };
+        let path = directory.join(format!("{LABEL}.plist"));
+        if previous_definition(&path)?.is_none() {
+            // A user without a GUI launchd domain can still ask whether the
+            // service is installed. An uninstall deliberately retains binaries.
+            return Ok(None);
+        }
+        let target = format!("{}/{LABEL}", domain(options.scope)?);
+        let is_loaded = loaded(&target)?;
+        let extract = |key: &str, format: &str| -> Result<Vec<u8>> {
+            Ok(checked(
+                Command::new("plutil")
+                    .args(["-extract", key, format, "-o", "-"])
+                    .arg(&path),
+            )?
+            .stdout)
+        };
+        let label = String::from_utf8(extract("Label", "raw")?)?;
+        if label.trim() != LABEL {
+            bail!("existing launchd service has a different label");
+        }
+        let actual: Vec<String> = serde_json::from_slice(&extract("ProgramArguments", "json")?)?;
+        let mut expected = vec![path_text(&options.executable)?.to_owned()];
+        expected.extend(arguments(options, "run").iter().map(|arg| {
+            arg.to_str()
+                .expect("validated Unicode service arguments")
+                .to_owned()
+        }));
+        if actual != expected {
+            bail!("existing launchd service uses a different executable or configuration snapshot");
+        }
+        if options.scope == Scope::System {
+            let username = String::from_utf8(extract("UserName", "raw")?)?;
+            if username.trim() != system_username(options)? {
+                bail!("existing launchd service runs as a different user");
+            }
+        }
+        if is_loaded {
+            let output = checked(Command::new("launchctl").args(["print", &target]))?;
+            let description = String::from_utf8(output.stdout)?;
+            let field = |key: &str| {
+                description
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(key))
+            };
+            let registered_path =
+                field("path = ").context("launchd returned no registered plist path")?;
+            let program = field("program = ").context("launchd returned no registered program")?;
+            if !same_path(Path::new(registered_path), &path)?
+                || !same_path(Path::new(program), &options.executable)?
+            {
+                bail!("loaded launchd service does not match its managed installation");
+            }
+            let args = description
+                .lines()
+                .skip_while(|line| line.trim() != "arguments = {")
+                .skip(1)
+                .take_while(|line| line.trim() != "}")
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            if args != expected {
+                bail!(
+                    "loaded launchd service uses different arguments; reinstall it before updating"
+                );
+            }
+        }
+        // A loaded KeepAlive job may be waiting for a restart. Boot it out before
+        // replacement and restore it afterwards, just like a running job.
+        Ok(Some(InstalledService { running: is_loaded }))
     }
 
     pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
@@ -1085,6 +1373,58 @@ mod platform {
 
     fn missing_service(error: &windows_service::Error) -> bool {
         matches!(error, windows_service::Error::Winapi(error) if error.raw_os_error() == Some(1060))
+    }
+
+    pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        if options.username.is_some() {
+            bail!("--username is only supported for Linux and macOS system services");
+        }
+        let (command, running) = match options.scope {
+            Scope::User => {
+                let Some(command) = current_autostart(&RegKey::predef(HKEY_CURRENT_USER))? else {
+                    return Ok(None);
+                };
+                (
+                    managed_command(&command, options, "hidden-start")?,
+                    autostart_running(options)?,
+                )
+            }
+            Scope::System => {
+                let manager =
+                    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                        .context("open Windows Service Control Manager")?;
+                let service = match manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+                ) {
+                    Ok(service) => service,
+                    Err(error) if missing_service(&error) => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                let config = service.query_config()?;
+                if config.display_name != OsStr::new("Codex app-server WebSocket bridge")
+                    || config.service_type != ServiceType::OWN_PROCESS
+                {
+                    bail!("refusing to update an unmanaged Windows service {SERVICE_NAME}");
+                }
+                let state = service.query_status()?.current_state;
+                let running = match state {
+                    ServiceState::Running | ServiceState::StartPending => true,
+                    ServiceState::Stopped => false,
+                    _ => bail!(
+                        "Windows service is in state {state:?}; stop or start it before updating"
+                    ),
+                };
+                (
+                    managed_command(path_text(&config.executable_path)?, options, "service-run")?,
+                    running,
+                )
+            }
+        };
+        if !same_path(Path::new(&command[0]), &options.executable)? {
+            bail!("existing Windows service uses a different executable");
+        }
+        Ok(Some(InstalledService { running }))
     }
 
     fn manage_system(action: Action, options: &ServiceOptions) -> Result<()> {
@@ -1554,6 +1894,9 @@ mod platform {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     use super::*;
+    pub fn inspect_installed(_: &ServiceOptions) -> Result<Option<InstalledService>> {
+        bail!("service updates are supported on Windows, macOS, and Linux");
+    }
     pub fn manage(_: Action, _: &ServiceOptions) -> Result<()> {
         bail!("service installation is supported on Windows, macOS, and Linux");
     }

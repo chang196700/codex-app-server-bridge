@@ -23,6 +23,42 @@
 
 工作流使用内置 `GITHUB_TOKEN`，无需额外配置 Secrets。`main` 必须允许工作流提交版本变更；该 Token 创建的提交不会再次触发工作流。发布串行执行，排队的任务读取最新 `main`，因此短时间内的多次推送可能合并为一个 Release。发布中断时，可以重跑失败的任务，或在 `main` 上手动运行 **Release** 工作流。已有标签始终对应原始源码，完整发布的版本不会被覆盖。构建失败时，版本提交保留在 `main`，不会发布缺少产物的 Release。
 
+## 从 GitHub 更新
+
+```sh
+# 更新已安装的用户服务或登录启动程序
+codex-app-server-bridge update
+
+# 仅更新执行当前命令的程序文件
+codex-app-server-bridge update --self
+
+# 定位使用自定义配置文件 / 状态目录安装的服务
+codex-app-server-bridge --config /path/to/bridge.toml update
+```
+
+`update` 会检查操作系统中的服务或启动项注册，更新所选用户 `~/.codex-app-server-bridge` 目录中的固定程序副本。未安装服务时会报错提示未安装；`service uninstall` 遗留的程序文件不算已安装。默认作用范围为 `user`。
+
+命令读取已安装程序的版本，从 GitHub 下载最新稳定 Release 中匹配更新程序操作系统和架构的压缩包。Linux 下，GNU 更新程序选择 GNU/glibc 包，musl 更新程序选择 musl 包。替换文件前会根据该 Release 的 `SHA256SUMS` 校验压缩包；目标版本已等于或高于最新版本时，不修改目标文件，也不会降级。
+
+服务更新保留启动注册和 `<state_dir>/service.toml` 配置快照。运行中的服务在下载和校验完成后才会停止，并在替换程序后重启；已停止的服务保持停止。替换或重启失败时，会尝试回滚到原程序和服务状态。若还需应用配置变更，请随后重新执行 `service install`。定位自定义服务时，使用安装时相同的 `--user-home` 和 `--config` 选择。
+
+更新 Linux 或 macOS 系统服务时，需要管理员权限，并明确提供目标用户名和用户主目录：
+
+```sh
+# Linux；macOS 将用户主目录改为 /Users/alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge \
+  --user-home /home/alice update --scope system --username alice
+```
+
+更新 Windows 系统服务时，在目标用户本人提升权限的管理员 PowerShell 中执行：
+
+```powershell
+& 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe' `
+  --user-home 'C:\Users\alice' update --scope system
+```
+
+`update --self` 替换执行当前命令的程序文件，不读取配置，不要求已安装服务，也不停止或重启服务；不能与 `--scope` 或 `--username` 组合使用。执行用户需要拥有程序所在目录的写入权限。如果从固定服务程序路径执行 `--self`，该路径的文件也会被替换，但已运行的服务进程仍需重启才能使用新版本。要自动让运行中的服务应用新版本，请使用 `update`。
+
 ## 构建与运行
 
 安装 Rust / rustup 和当前平台的 Rust 原生构建工具。工具链版本由仓库中的 `rust-toolchain.toml` 确定。
@@ -161,9 +197,9 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 
 ## 安装服务或开机启动
 
-`service install` 会将当前程序复制到所选用户主目录下的 `~/.codex-app-server-bridge/codex-app-server-bridge`（Windows 为 `codex-app-server-bridge.exe`），并将这个稳定路径注册为启动程序。可以直接从构建目录或下载目录安装，安装后可删除来源文件；服务或启动项使用期间需保留安装目录中的副本。升级时，使用新版程序再次执行相同的 `service install` 命令，安装会更新程序副本和配置快照并重启实例。
+`service install` 会将当前程序复制到所选用户主目录下的 `~/.codex-app-server-bridge/codex-app-server-bridge`（Windows 为 `codex-app-server-bridge.exe`），并将这个稳定路径注册为启动程序。可以直接从构建目录或下载目录安装，安装后可删除来源文件；服务或启动项使用期间需保留安装目录中的副本。使用 [`update`](#从-github-更新) 可从 GitHub 升级服务并保留配置快照；也可以使用新版程序再次执行相同的 `service install` 命令，同时更新程序副本和配置快照并重启实例。
 
-安装目录由所选 `user_home` 决定，不随 `--config` 的位置改变。安装不会自动将目录加入 `PATH`，后续可使用安装副本的完整路径执行命令。从安装副本本身执行 `service install` 时会跳过自复制，更新配置及启动注册；升级版本时应从新构建或下载的程序执行 `service install`。
+安装目录由所选 `user_home` 决定，不随 `--config` 的位置改变。安装不会自动将目录加入 `PATH`，后续可使用安装副本的完整路径执行命令。从安装副本本身执行 `service install` 时会跳过自复制，更新配置及启动注册；安装副本可以通过 `update` 获取新版本。
 
 `service install` 会注册并立即启动；重复安装会更新配置并重新启动。安装将当前有效配置保存到 `<state_dir>/service.toml`，后台进程读取此快照。修改原始配置、端口或 `CODEX_HOME` 后，需要再次运行 `service install` 才会应用；单独 `service start` 不会重新生成快照。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
 
