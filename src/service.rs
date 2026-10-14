@@ -574,6 +574,24 @@ mod platform {
         command
     }
 
+    fn stop_if_running(scope: Scope, name: &str) -> Result<()> {
+        let output =
+            checked(systemctl(scope).args(["show", name, "--property=ActiveState", "--value"]))?;
+        let state = String::from_utf8(output.stdout)?;
+        let state = state.trim();
+        if state.is_empty() {
+            bail!("systemd returned no ActiveState for {name}");
+        }
+        // A malformed managed unit can be inactive with LoadState=bad-setting.
+        // Asking systemd to stop it then fails with "not loaded" and would
+        // prevent repairing or removing its definition. Only an explicitly
+        // inactive unit may skip stop; inspection and all other errors propagate.
+        if state != "inactive" {
+            checked(systemctl(scope).args(["stop", name]))?;
+        }
+        Ok(())
+    }
+
     pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
         let path = unit_path(options);
         let name = format!("{SERVICE_NAME}.service");
@@ -619,7 +637,9 @@ mod platform {
                 let identity = if options.scope == Scope::System {
                     let username = system_username(options)?;
                     prepare_system_files(options, username)?;
-                    format!("User={}\n", quote(username, false))
+                    // User= is a scalar, unlike ExecStart/Environment. A numeric
+                    // UID avoids quoting or specifier interpretation entirely.
+                    format!("User={}\n", user_id(username)?)
                 } else {
                     String::new()
                 };
@@ -636,9 +656,8 @@ mod platform {
                     "multi-user.target"
                 };
                 let content = format!(
-                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nWorkingDirectory={}\nEnvironment={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
+                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nEnvironment={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
                     command.join(" "),
-                    quote(path_text(&options.user_home)?, false),
                     quote(&format!("HOME={}", path_text(&options.user_home)?), false),
                     quote(
                         &format!("CODEX_HOME={}", path_text(&options.codex_home)?),
@@ -649,7 +668,7 @@ mod platform {
                 let mut registration_changed = false;
                 let result = (|| -> Result<()> {
                     if previous.is_some() {
-                        checked(systemctl(options.scope).args(["stop", &name]))?;
+                        stop_if_running(options.scope, &name)?;
                     }
                     executable.apply()?;
                     write_managed(&path, &content)?;
@@ -662,7 +681,7 @@ mod platform {
                 if let Err(error) = result {
                     let recovery = (|| -> Result<()> {
                         if registration_changed {
-                            checked(systemctl(options.scope).args(["stop", &name]))?;
+                            stop_if_running(options.scope, &name)?;
                             if !was_enabled {
                                 checked(systemctl(options.scope).args(["disable", &name]))?;
                             }
@@ -692,16 +711,17 @@ mod platform {
             Action::Uninstall => {
                 check_managed(&path)?;
                 if path.exists() {
-                    checked(systemctl(options.scope).args(["disable", "--now", &name]))?;
+                    stop_if_running(options.scope, &name)?;
+                    checked(systemctl(options.scope).args(["disable", &name]))?;
                     std::fs::remove_file(&path)?;
                     checked(systemctl(options.scope).arg("daemon-reload"))?;
                 }
                 println!("Uninstalled {name}");
             }
-            Action::Start | Action::Stop | Action::Status => {
+            Action::Stop => stop_if_running(options.scope, &name)?,
+            Action::Start | Action::Status => {
                 let verb = match action {
                     Action::Start => "start",
-                    Action::Stop => "stop",
                     _ => "status",
                 };
                 let output = checked(systemctl(options.scope).args([verb, "--no-pager", &name]))?;
