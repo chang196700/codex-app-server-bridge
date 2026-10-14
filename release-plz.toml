@@ -1,0 +1,12 @@
+[workspace]
+# This application is distributed through GitHub Releases, not a Cargo registry.
+git_only = true
+release_always = true
+semver_check = false
+dependencies_update = false
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# Publish only after all native archives and their checksums have been uploaded.
+git_release_draft = true
+git_release_latest = false
+repo_url = "https://github.com/chang196700/codex-app-server-bridge"
