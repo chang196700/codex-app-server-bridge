@@ -94,7 +94,7 @@ fn executable(path: &Path) -> Result<PathBuf> {
             bail!("Codex file is not executable: {}", path.display());
         }
     }
-    // Keep stable shims and symlinks in the service snapshot so a Codex upgrade
+    // Keep stable shims and symlinks in the service configuration so a Codex upgrade
     // can replace their targets without leaving a version-specific path behind.
     Ok(path.to_path_buf())
 }

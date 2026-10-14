@@ -40,7 +40,7 @@ codex-app-server-bridge --config /path/to/bridge.toml update
 
 The command reads the installed binary's version and downloads the latest stable GitHub Release for the updater's operating system and architecture. On Linux, a GNU updater selects the GNU/glibc archive and a musl updater selects the musl archive. It verifies the archive against the release's `SHA256SUMS` before replacing any executable. If the target version is already equal to or newer than the latest release, it leaves the target unchanged.
 
-Service updates preserve the startup registration and `<state_dir>/service.toml` configuration snapshot. A running service is stopped only after the download is validated, then restarted with the new binary; a stopped service remains stopped. If replacement or restart fails, the updater attempts to restore the previous binary and service state. To apply configuration changes as well, rerun `service install` afterward. Use the same `--user-home` and `--config` selection as the installation when locating a custom service.
+Service updates preserve the startup registration and the selected configuration file. A running service is stopped only after the download is validated, then restarted with the new binary and rereads that file; a stopped service remains stopped. If replacement or restart fails, the updater attempts to restore the previous binary and service state. Use the same `--user-home` and `--config` selection as the installation when locating a custom service.
 
 For a Linux or macOS system service, supply the target username and home directory with the required administrator privileges:
 
@@ -136,7 +136,7 @@ Configuration precedence:
 | Codex executable | TOML `codex_path` → automatic detection on `PATH` and in common installation locations |
 | Port | `--port` → TOML `port` → `0` |
 
-A TOML `user_home` value takes effect after the configuration is read; it does not change which configuration file is selected. A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. Unknown TOML fields are rejected so that typos are not silently ignored.
+A TOML `user_home` value takes effect after the configuration is read; it does not change which configuration file is selected. A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. When editing a service's paths afterward, use absolute paths or `~` so they do not depend on the service manager's working directory. Unknown TOML fields are rejected so that typos are not silently ignored.
 
 ### Read and update configuration
 
@@ -164,7 +164,18 @@ codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
 
 Configuration keys support dot-separated path navigation. The current schema has only top-level fields, so use names such as `port` and `socket_path`; there are no nested settings to address yet. Unknown fields or subkeys are rejected.
 
-Configuration changes do not reload a running instance. Restart a foreground process to apply them. For an installed service, rerun the same `service install` command to refresh `<state_dir>/service.toml` and restart the service; `service start` alone keeps using the existing snapshot.
+The service reads the same configuration file that `config list`, `config get`, and `config set` select: the default `~/.codex-app-server-bridge/config.toml`, or the file supplied with `--config` at installation. Configuration changes do not reload a running instance. Restart a foreground process, or use `service restart` for an installed service; an operating-system service restart or reboot also applies the changes. Starting a stopped service reads the file again.
+
+```sh
+codex-app-server-bridge config set port 63100
+codex-app-server-bridge service restart --scope user
+
+# Use the same custom file for configuration and service commands
+codex-app-server-bridge --config /path/to/bridge.toml config set auto_start_codex_app_server_daemon true
+codex-app-server-bridge --config /path/to/bridge.toml service restart --scope user
+```
+
+Changes to `user_home` or `state_dir` affect installation or runtime locations. Stop the service before editing those fields, then run `service install` with the intended home and configuration selection; do not rely on a simple restart to relocate an installation.
 
 ## Start the Codex daemon automatically
 
@@ -172,7 +183,7 @@ Set `auto_start_codex_app_server_daemon = true` to let the bridge start an unava
 
 The bridge uses its existing socket health check. A healthy daemon is left running. If connecting to the socket returns `NotFound` or `ConnectionRefused`, a background worker runs the idempotent `codex app-server daemon start` command with the selected `CODEX_HOME`. Permission errors, failed WebSocket handshakes, and timeouts do not trigger a start. Startup attempts do not block the WebSocket listener; failures are logged and retried with an exponential delay from 5 to 60 seconds. Stopping the bridge does not stop the independent Codex daemon.
 
-Omit `codex_path` to search `PATH` and common installation locations, or set it to the Codex executable's path. Absolute paths, a leading `~`, and relative paths follow the configuration path rules above. When automatic daemon startup is enabled, `service install` resolves the executable and saves its absolute path in `<state_dir>/service.toml`, without changing the original configuration. After changing the option, executable path, or Codex installation location, rerun `service install` to refresh this snapshot.
+Omit `codex_path` to search `PATH` and common installation locations, or set it to the Codex executable's path. Absolute paths, a leading `~`, and relative paths follow the configuration path rules above. When automatic daemon startup is enabled, `service install` resolves the executable and saves its absolute path in the selected configuration file, preserving comments and other settings. After changing the option, `codex_path`, or `codex_home`, restart the bridge service to apply the change. If Codex moves, update `codex_path` before restarting.
 
 On Unix, an npm-installed launcher also needs Node on the service's `PATH`. The bridge adds the selected Codex executable's directory to the startup command's `PATH`, supporting installations such as nvm that keep `node` alongside `codex`. If Node is unavailable there or on the service's existing `PATH`, set `codex_path` to the native executable within the complete Codex package.
 
@@ -184,7 +195,7 @@ On Windows, automatic daemon startup requires an ordinary, non-elevated user pro
 
 Automatic environment updates are **disabled by default**, including when `publish_codex_app_server_ws_url_environment` is omitted. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
 
-If an existing configuration uses the old name `publish_environment`, replace it with `publish_codex_app_server_ws_url_environment`. For an installed service, also rerun `service install` to update its configuration snapshot.
+If an existing configuration uses the old name `publish_environment`, replace it with `publish_codex_app_server_ws_url_environment`, then restart the bridge.
 
 To set `CODEX_APP_SERVER_WS_URL` automatically, enable this option in `~/.codex-app-server-bridge/config.toml`:
 
@@ -192,7 +203,7 @@ To set `CODEX_APP_SERVER_WS_URL` automatically, enable this option in `~/.codex-
 publish_codex_app_server_ws_url_environment = true
 ```
 
-After changing it, restart the foreground process. For an installed service, rerun the same `service install` command to update the configuration snapshot and restart the service. To disable an enabled publisher, first stop the old process so it can remove the variable it published, then set the option to `false` and start the bridge or reinstall the service.
+After changing it, restart the foreground process or run `service restart` for an installed service. To disable an enabled publisher, first stop the old process so it can remove the variable it published, then set the option to `false` and start the bridge or service.
 
 The following behavior applies only when publication is enabled. The bridge publishes the URL after connecting to the socket and completing a WebSocket health check. If the socket becomes unavailable, it withdraws the variable it published and republishes it when the socket recovers. It also cleans up on normal exit. Cleanup checks the existing value and preserves a different value subsequently written by the user or another program.
 
@@ -222,11 +233,11 @@ Native Windows services run in Session 0, so their environment change broadcasts
 
 ## Install a service or enable startup
 
-`service install` copies the current executable to `~/.codex-app-server-bridge/codex-app-server-bridge` (`codex-app-server-bridge.exe` on Windows), under the selected user's home directory, and registers this stable path for startup. You can install directly from a build or download directory and remove that source copy afterward. Keep the installed copy while the service or startup entry is in use. Use [`update`](#update-from-github) to upgrade the service from GitHub while retaining its configuration snapshot. You can also run the same `service install` command using a new executable; installation refreshes both the installed copy and configuration snapshot and restarts the instance.
+`service install` copies the current executable to `~/.codex-app-server-bridge/codex-app-server-bridge` (`codex-app-server-bridge.exe` on Windows), under the selected user's home directory, and registers this stable path for startup. You can install directly from a build or download directory and remove that source copy afterward. Keep the installed copy while the service or startup entry is in use. Use [`update`](#update-from-github) to upgrade the service from GitHub while retaining its configuration file. You can also run the same `service install` command using a new executable to update the installed copy and startup registration and restart the instance.
 
 The installation directory follows the selected `user_home`, regardless of where `--config` points. Installation does not add the directory to `PATH`; use the installed executable's full path for later commands if needed. Running `service install` from the installed copy skips copying the executable onto itself and updates the configuration and startup registration. The installed copy can fetch a newer version with `update`.
 
-`service install` registers and immediately starts the service or startup entry. Running it again updates the configuration and restarts the instance. Installation saves the effective configuration to `<state_dir>/service.toml`, which the background process reads. Changes to the original configuration, port, or `CODEX_HOME` require another `service install` to take effect; `service start` alone does not regenerate the snapshot. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
+`service install` registers and immediately starts the service or startup entry. Running it again updates the registration and restarts the instance. The registration points directly to the selected configuration file. Installation saves the necessary user identity, Codex directory, command-line overrides, and resolved Codex executable path to that same file while preserving comments and unrelated settings. Configured paths are made absolute for service use; omitted `socket_path` and `state_dir` remain derived defaults instead of being frozen into explicit values. Changes to ordinary settings such as the port or daemon options take effect after `service restart`, without reinstalling. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
 
 On Linux, the generated systemd unit stops only the bridge process, preserving the independent Codex daemon across bridge stops and restarts.
 
@@ -241,10 +252,11 @@ $bridge = Join-Path $HOME '.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope user
 & $bridge service stop --scope user
 & $bridge service start --scope user
+& $bridge service restart --scope user
 & $bridge service uninstall --scope user
 ```
 
-Installation explicitly fails if the Run command exceeds 260 UTF-16 characters. Use a shorter state directory path, or choose a system service. `stop` requests a graceful exit and waits for the instance lock to be released; it does not forcibly terminate the process.
+Installation explicitly fails if the Run command exceeds 260 UTF-16 characters. Use a shorter configuration file path, or choose a system service. `stop` requests a graceful exit and waits for the instance lock to be released; it does not forcibly terminate the process.
 
 ### Windows: native system service
 
@@ -257,6 +269,7 @@ $bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope system
 & $bridge service stop --scope system
 & $bridge service start --scope system
+& $bridge service restart --scope system
 & $bridge service uninstall --scope system
 ```
 
@@ -271,6 +284,7 @@ codex-app-server-bridge service install --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service status --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service stop --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service start --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service restart --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service uninstall --scope user
 ```
 
@@ -294,10 +308,11 @@ sudo ./target/release/codex-app-server-bridge \
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service status --scope system --username alice
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service stop --scope system --username alice
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service start --scope system --username alice
+sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice service restart --scope system --username alice
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
 ```
 
-The service file is `/etc/systemd/system/codex-app-server-bridge.service`. The process runs as `alice` and must be able to access the executable, configuration snapshot, and Codex socket. Installation assigns the dedicated installation and state directories, installed executable, and configuration snapshot to the target user; the executable has mode `0755`. Any parent directories created for this purpose within the user's home also belong to the target user. Existing parent directories retain their ownership and permissions. Installation does not recursively change permissions in the user home or Codex directory. The user's home directory must already exist.
+The service file is `/etc/systemd/system/codex-app-server-bridge.service`. The process runs as `alice` and must be able to access the executable, selected configuration file, and Codex socket. Installation assigns the dedicated installation and state directories, installed executable, and selected configuration file to the target user; the executable has mode `0755`. Any parent directories created for this purpose within the user's home also belong to the target user. Existing parent directories retain their ownership and permissions. Installation does not recursively change permissions in the user home or Codex directory. The user's home directory must already exist.
 
 ### macOS: LaunchAgent at login
 
@@ -308,6 +323,7 @@ codex-app-server-bridge service install --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service status --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service stop --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service start --scope user
+"$HOME/.codex-app-server-bridge/codex-app-server-bridge" service restart --scope user
 "$HOME/.codex-app-server-bridge/codex-app-server-bridge" service uninstall --scope user
 ```
 
@@ -323,6 +339,7 @@ sudo ./target/release/codex-app-server-bridge \
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service status --scope system --username alice
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service stop --scope system --username alice
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service start --scope system --username alice
+sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice service restart --scope system --username alice
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
@@ -330,7 +347,7 @@ The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.pli
 
 ### Uninstall and logs
 
-`service uninstall` stops and removes the selected startup entry or service. The installed executable in `~/.codex-app-server-bridge`, `config.toml` (or your custom configuration file), configuration snapshot, and historical logs are retained for reinstallation or troubleshooting. A normal stop withdraws environment variables published by this instance. Cleanup cannot be guaranteed immediately after forced termination or a power loss; the next run uses the saved records to resume cleanup.
+`service uninstall` stops and removes the selected startup entry or service. The installed executable in `~/.codex-app-server-bridge`, `config.toml` (or your custom configuration file), and historical logs are retained for reinstallation or troubleshooting. A normal stop withdraws environment variables published by this instance. Cleanup cannot be guaranteed immediately after forced termination or a power loss; the next run uses the saved records to resume cleanup.
 
 | Run mode | Logs |
 | --- | --- |

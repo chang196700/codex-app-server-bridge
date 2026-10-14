@@ -1,4 +1,4 @@
-use crate::config::{self, Config};
+use crate::config::{self, Config, Settings};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde_json::Value as JsonValue;
@@ -53,6 +53,77 @@ pub fn run(action: &Action, config_path: Option<&Path>, user_home: Option<&Path>
         }
     }
     Ok(())
+}
+
+/// Save service installation context in the user's configuration while retaining
+/// its comments and leaving unspecified settings at their built-in defaults.
+pub fn prepare_service(
+    path: &Path,
+    user_home: Option<&Path>,
+    codex_home: Option<&Path>,
+    port: Option<u16>,
+    detected_codex_path: Option<&Path>,
+    windows_user_sid: Option<&str>,
+) -> Result<Settings> {
+    let home = config::home_directory(user_home)?;
+    let _lock = config::lock_configuration(path, &home)?;
+    // Compute installation settings from the locked document, not a Settings
+    // value read earlier while a concurrent `config set` could still change it.
+    let mut document = read_document(path, true)?;
+    let configured = parse_config(&document, path)?;
+    let explicit_socket = configured.socket_path.is_some();
+    let explicit_state = configured.state_dir.is_some();
+    let settings = Settings::from_config(configured, user_home, codex_home, port, true)?;
+    let table = document.as_table_mut();
+
+    // Service managers may provide a different HOME/CODEX_HOME. Preserve the
+    // selected homes, but let defaults derived from them follow future edits.
+    set_path(table, "user_home", &settings.user_home)?;
+    set_path(table, "codex_home", &settings.codex_home)?;
+    if explicit_socket {
+        set_path(table, "socket_path", &settings.socket_path)?;
+    }
+    if explicit_state {
+        set_path(table, "state_dir", &settings.state_dir)?;
+    }
+    if let Some(port) = port {
+        set_item(table, &["port"], Value::from(i64::from(port)))?;
+    }
+    if let Some(path) = settings.config.codex_path.as_deref() {
+        set_path(table, "codex_path", path)?;
+    } else if settings.config.auto_start_codex_app_server_daemon
+        && let Some(path) = detected_codex_path
+    {
+        if path.as_os_str().is_empty() {
+            bail!("detected Codex executable path must not be empty");
+        }
+        // A stable launcher path also works under a service manager's minimal
+        // PATH. Keep it editable in the same file as the other configuration.
+        set_path(
+            table,
+            "codex_path",
+            &config::absolute(path, &settings.user_home)?,
+        )?;
+    }
+    if let Some(sid) = windows_user_sid {
+        set_item(table, &["windows_user_sid"], Value::from(sid))?;
+    }
+
+    // Validate exactly what will be read by the service, without command-line
+    // overrides or environment fallbacks, before touching the original file.
+    let stored = parse_config(&document, path)?;
+    let validated = Settings::from_config(stored, None, None, None, false)?;
+    config::write_configuration(path, document.to_string().as_bytes(), &validated.user_home)?;
+
+    let saved = read_document(path, false)?;
+    Settings::from_config(parse_config(&saved, path)?, None, None, None, false)
+}
+
+fn set_path(table: &mut Table, name: &str, path: &Path) -> Result<()> {
+    let path = path
+        .to_str()
+        .with_context(|| format!("{name} must be a valid UTF-8 path"))?;
+    set_item(table, &[name], Value::from(path))
 }
 
 fn read_document(path: &Path, allow_missing: bool) -> Result<DocumentMut> {

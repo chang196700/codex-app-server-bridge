@@ -171,6 +171,7 @@ fn main() -> Result<()> {
         println!("{}", path.display());
         return Ok(());
     }
+    let config_path = config::resolve_config_path(cli.config.as_deref(), cli.user_home.as_deref())?;
     let mut settings = Settings::load(
         cli.config.as_deref(),
         cli.user_home.as_deref(),
@@ -213,15 +214,16 @@ fn main() -> Result<()> {
                     "system service updates require --username and an explicit --user-home for the target user"
                 );
             }
-            update::run(Some(&service::ServiceOptions {
+            let options = service::ServiceOptions {
                 scope,
                 username,
                 executable: service::installed_executable(&settings.user_home),
-                config_path: settings.state_dir.join("service.toml"),
+                config_path,
                 user_home: settings.user_home,
                 codex_home: settings.codex_home,
                 state_dir: settings.state_dir,
-            }))
+            };
+            update::run(Some(&options))
         }
         Command::Service {
             action,
@@ -246,17 +248,16 @@ fn main() -> Result<()> {
                     "system services require --username and an explicit --user-home for the target user"
                 );
             }
-            let snapshot = settings.state_dir.join("service.toml");
             if matches!(action, service::Action::Install) {
-                if settings.config.auto_start_codex_app_server_daemon {
+                let detected_codex_path = if settings.config.auto_start_codex_app_server_daemon {
                     daemon::check_launch_context()?;
-                    // Service managers may have a minimal PATH. Save the
-                    // detected stable launcher path in the snapshot only.
-                    settings.config.codex_path = Some(codex_path::resolve(
+                    Some(codex_path::resolve(
                         settings.config.codex_path.as_deref(),
                         &settings.user_home,
-                    )?);
-                }
+                    )?)
+                } else {
+                    None
+                };
                 // The stable executable always lives in the selected user's
                 // default directory, even when --config selects another file.
                 let default_config = config::resolve_config_path(None, Some(&settings.user_home))?;
@@ -282,19 +283,25 @@ fn main() -> Result<()> {
                 }
                 config::private_dir(install_directory)?;
                 config::private_dir(&settings.state_dir)?;
-                if settings.config.windows_user_sid.is_none() {
-                    settings.config.windows_user_sid = environment::current_user_sid()?;
-                }
-                write_atomic(
-                    &snapshot,
-                    toml::to_string_pretty(&settings.config)?.as_bytes(),
+                let sid = settings
+                    .config
+                    .windows_user_sid
+                    .clone()
+                    .or(environment::current_user_sid()?);
+                settings = config_command::prepare_service(
+                    &config_path,
+                    cli.user_home.as_deref(),
+                    cli.codex_home.as_deref(),
+                    cli.port,
+                    detected_codex_path.as_deref(),
+                    sid.as_deref(),
                 )?;
             }
             let options = service::ServiceOptions {
                 scope,
                 username,
                 executable: service::installed_executable(&settings.user_home),
-                config_path: snapshot,
+                config_path,
                 user_home: settings.user_home,
                 codex_home: settings.codex_home,
                 state_dir: settings.state_dir,

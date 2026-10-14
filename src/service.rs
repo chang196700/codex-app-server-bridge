@@ -21,6 +21,7 @@ pub enum Action {
     Uninstall,
     Start,
     Stop,
+    Restart,
     Status,
 }
 
@@ -47,9 +48,17 @@ pub fn installed_executable(user_home: &Path) -> PathBuf {
 
 pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
     validate_paths(options)?;
+    if action == Action::Restart {
+        inspect_installed(options)?
+            .context("service is not installed; run `service install` first")?;
+        let old_pid = status_pid(options);
+        platform::manage(Action::Stop, options)?;
+        platform::manage(Action::Start, options)?;
+        return wait_for_runtime(options, old_pid);
+    }
     if action == Action::Install {
         if !std::env::current_exe()?.is_file() || !options.config_path.is_file() {
-            bail!("source executable and configuration snapshot must exist before installation");
+            bail!("source executable and configuration file must exist before installation");
         }
         if options.executable != installed_executable(&options.user_home) {
             bail!(
@@ -84,7 +93,7 @@ pub struct InstalledService {
 }
 
 /// Inspect OS registration, not just the executable retained after uninstall.
-/// An existing registration for a different executable/snapshot is an error.
+/// An existing registration for a different executable/configuration is an error.
 pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
     validate_paths(options)?;
     if options.executable != installed_executable(&options.user_home) {
@@ -94,7 +103,7 @@ pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledSer
 }
 
 /// Install an already downloaded and verified executable without changing the
-/// registered service definition or its configuration snapshot.
+/// registered service definition or its configuration file.
 pub fn update_binary(
     options: &ServiceOptions,
     candidate: &Path,
@@ -410,7 +419,7 @@ fn replace_executable(source: &Path, destination: &Path) -> Result<()> {
 
 fn installation_failure(error: anyhow::Error, recovery: Result<()>) -> anyhow::Error {
     match recovery {
-        Ok(()) => error.context("installation failed; previous executable/service registration restored where present (the configuration snapshot is not rolled back)"),
+        Ok(()) => error.context("installation failed; previous executable/service registration restored where present (the configuration file is not rolled back)"),
         Err(recovery) => error.context(format!("installation failed and recovery was incomplete: {recovery:#}")),
     }
 }
@@ -426,8 +435,8 @@ fn path_text(path: &Path) -> Result<&str> {
 }
 
 fn arguments(options: &ServiceOptions, subcommand: &str) -> Vec<std::ffi::OsString> {
-    // Installation snapshots pin the target user's paths and identity. Keeping
-    // only the snapshot argument also fits Windows' limited Run-key command.
+    // All settings live in this one configuration file. Keeping only its path
+    // also fits Windows' limited Run-key command.
     vec![
         "--config".into(),
         options.config_path.as_os_str().to_owned(),
@@ -566,7 +575,7 @@ fn user_id(username: &str) -> Result<u32> {
         .context("id returned an invalid user ID")
 }
 
-/// Prepare an elevated installation before the snapshot is written. Existing
+/// Prepare an elevated installation before its configuration is written. Existing
 /// parent directories retain their owner and permissions; only parents created
 /// here inside the target home are assigned to that user.
 #[cfg(unix)]
@@ -660,7 +669,7 @@ fn prepare_system_files(options: &ServiceOptions, username: &str) -> Result<()> 
             .file_type()
             .is_symlink()
     {
-        bail!("system service state directory and snapshot must not be symbolic links");
+        bail!("system service state directory and configuration must not be symbolic links");
     }
     let directory = std::fs::canonicalize(&options.state_dir)?;
     if directory.parent().is_none()
@@ -767,7 +776,7 @@ mod platform {
             .filter_map(|line| line.trim().strip_prefix("ExecStart="))
             .collect::<Vec<_>>();
         if commands != [expected.join(" ")] {
-            bail!("existing systemd service uses a different executable or configuration snapshot");
+            bail!("existing systemd service uses a different executable or configuration file");
         }
         if options.scope == Scope::System {
             let expected_user = user_id(system_username(options)?)?.to_string();
@@ -872,15 +881,12 @@ mod platform {
                 // cgroup. Stop only the bridge so service updates/restarts do
                 // not terminate the independently managed Codex daemon.
                 let content = format!(
-                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nEnvironment={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nKillMode=process\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
+                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nKillMode=process\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
                     command.join(" "),
                     quote(&format!("HOME={}", path_text(&options.user_home)?), false),
-                    quote(
-                        &format!("CODEX_HOME={}", path_text(&options.codex_home)?),
-                        false
-                    ),
                 );
                 let mut executable = ExecutableInstall::stage(options)?;
+                let old_pid = status_pid(options);
                 let mut registration_changed = false;
                 let result = (|| -> Result<()> {
                     if previous.is_some() {
@@ -892,6 +898,7 @@ mod platform {
                     checked(systemctl(options.scope).arg("daemon-reload"))?;
                     checked(systemctl(options.scope).args(["enable", &name]))?;
                     checked(systemctl(options.scope).args(["start", &name]))?;
+                    wait_for_runtime(options, old_pid)?;
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -943,6 +950,7 @@ mod platform {
                 let output = checked(systemctl(options.scope).args([verb, "--no-pager", &name]))?;
                 print!("{}", String::from_utf8_lossy(&output.stdout));
             }
+            Action::Restart => unreachable!("restart is handled by the service dispatcher"),
         }
         Ok(())
     }
@@ -1037,7 +1045,7 @@ mod platform {
                 .to_owned()
         }));
         if actual != expected {
-            bail!("existing launchd service uses a different executable or configuration snapshot");
+            bail!("existing launchd service uses a different executable or configuration file");
         }
         if options.scope == Scope::System {
             let username = String::from_utf8(extract("UserName", "raw")?)?;
@@ -1114,14 +1122,14 @@ mod platform {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let content = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<!-- {MANAGED_MARKER} -->\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array>\n{args}\n</array>\n{identity}<key>WorkingDirectory</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>CODEX_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>3</integer>\n<key>ExitTimeOut</key><integer>30</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<!-- {MANAGED_MARKER} -->\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array>\n{args}\n</array>\n{identity}<key>WorkingDirectory</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>3</integer>\n<key>ExitTimeOut</key><integer>30</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
                     xml(path_text(&options.user_home)?),
                     xml(path_text(&options.user_home)?),
-                    xml(path_text(&options.codex_home)?),
                     xml(path_text(&options.state_dir.join("service.stdout.log"))?),
                     xml(path_text(&options.state_dir.join("service.stderr.log"))?),
                 );
                 let mut executable = ExecutableInstall::stage(options)?;
+                let old_pid = status_pid(options);
                 let result = (|| -> Result<()> {
                     if was_loaded {
                         bootout(&target, options)?;
@@ -1135,6 +1143,7 @@ mod platform {
                             .arg(&domain)
                             .arg(&path),
                     )?;
+                    wait_for_runtime(options, old_pid)?;
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -1193,6 +1202,7 @@ mod platform {
                 let output = checked(Command::new("launchctl").args(["print", &target]))?;
                 print!("{}", String::from_utf8_lossy(&output.stdout));
             }
+            Action::Restart => unreachable!("restart is handled by the service dispatcher"),
         }
         Ok(())
     }
@@ -1492,6 +1502,7 @@ mod platform {
                 false
             };
             let mut executable = ExecutableInstall::stage(options)?;
+            let old_pid = status_pid(options);
             let result = (|| -> Result<()> {
                 if let Some(service) = &service {
                     stop_service(service)?;
@@ -1519,6 +1530,7 @@ mod platform {
                 service.set_failure_actions_on_non_crash_failures(true)?;
                 service.start::<&OsStr>(&[])?;
                 wait_for(service, ServiceState::Running)?;
+                wait_for_runtime(options, old_pid)?;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -1599,7 +1611,7 @@ mod platform {
             }
             Action::Stop => stop_service(&service)?,
             Action::Status => println!("{:?}", service.query_status()?),
-            Action::Install => unreachable!(),
+            Action::Install | Action::Restart => unreachable!(),
         }
         Ok(())
     }
@@ -1689,7 +1701,7 @@ mod platform {
             .eq_ignore_ascii_case(&expected_config.to_string_lossy())
         {
             bail!(
-                "existing service uses a different configuration snapshot: {}",
+                "existing service uses a different configuration file: {}",
                 arguments[2]
             );
         }
@@ -1737,12 +1749,14 @@ mod platform {
                     bail!("stop the foreground bridge before installing a new login startup entry");
                 }
                 let mut executable = ExecutableInstall::stage(options)?;
+                let old_pid = status_pid(options);
                 let (key, _) = current_user.create_subkey(RUN_KEY)?;
                 let result = (|| -> Result<()> {
                     stop_autostart(options)?;
                     executable.apply()?;
                     key.set_value(SERVICE_NAME, &command)?;
                     start_autostart(options)?;
+                    wait_for_runtime(options, old_pid)?;
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -1799,6 +1813,7 @@ mod platform {
                 println!("Login startup: {value}");
                 println!("Bridge running: {}", autostart_running(options)?);
             }
+            Action::Restart => unreachable!("restart is handled by the service dispatcher"),
         }
         Ok(())
     }
