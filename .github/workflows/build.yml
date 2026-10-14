@@ -28,6 +28,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - runner: macos-15-intel
             target: x86_64-apple-darwin
           - runner: macos-15
@@ -45,7 +49,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
       - name: Build and package native executable
+        if: ${{ !endsWith(matrix.target, '-musl') }}
         run: ./.github/scripts/build.ps1 -Target '${{ matrix.target }}'
+      - name: Build and package native musl executable
+        if: ${{ endsWith(matrix.target, '-musl') }}
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          RUST_IMAGE: rust:1.96.0-alpine@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            --env BUILD_TARGET \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            "$RUST_IMAGE" sh .github/scripts/build-musl.sh
       - name: Upload release package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

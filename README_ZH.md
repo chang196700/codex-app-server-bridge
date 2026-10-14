@@ -13,12 +13,13 @@
 | 平台 | 架构 | 压缩格式 |
 | --- | --- | --- |
 | Linux（GNU/glibc） | x86_64、ARM64 | `.tar.gz` |
+| Linux（静态 musl） | x86_64、ARM64 | `.tar.gz` |
 | macOS | Intel x86_64、Apple Silicon ARM64 | `.tar.gz` |
 | Windows（MSVC） | x86_64、ARM64 | `.zip` |
 
-六种构建均使用对应架构的 GitHub 原生 runner。Linux 使用 Ubuntu 24.04 构建，GNU 产物面向 glibc 2.39 及以上系统；旧发行版可从源码编译。
+八种构建均使用对应架构的 GitHub 原生 runner。Linux GNU 使用 Ubuntu 24.04 构建，产物面向 glibc 2.39 及以上系统。musl 产物在相同 x86_64/ARM64 架构 runner 的 Alpine 容器中静态链接，不依赖 glibc，适用于 Alpine 或 glibc 较旧的发行版；构建时会检查产物没有动态加载器及共享库依赖。
 
-推送到 `main` 后，工作流自动运行 [release-plz](https://release-plz.dev/) 更新版本和 `CHANGELOG.md`，由 `github-actions[bot]` 提交这些变更。六个平台全部通过格式检查、Clippy、release 编译和程序版本检查后，工作流创建 `v<版本>` 标签，并发布包含完整压缩包和校验文件的 GitHub Release。无需手动合并发布 PR，也不发布到 crates.io。版本号按 release-plz 的提交分析规则更新，建议使用 `fix: ...`、`feat: ...`、`feat!: ...` 等 Conventional Commits 表达变更类型。
+推送到 `main` 后，工作流自动运行 [release-plz](https://release-plz.dev/) 更新版本和 `CHANGELOG.md`，由 `github-actions[bot]` 提交这些变更。八个目标全部通过格式检查、Clippy、release 编译和程序版本检查后，工作流创建 `v<版本>` 标签，并发布包含完整压缩包和校验文件的 GitHub Release。无需手动合并发布 PR，也不发布到 crates.io。版本号按 release-plz 的提交分析规则更新，建议使用 `fix: ...`、`feat: ...`、`feat!: ...` 等 Conventional Commits 表达变更类型。
 
 工作流使用内置 `GITHUB_TOKEN`，无需额外配置 Secrets。`main` 必须允许工作流提交版本变更；该 Token 创建的提交不会再次触发工作流。发布串行执行，排队的任务读取最新 `main`，因此短时间内的多次推送可能合并为一个 Release。发布中断时，可以重跑失败的任务，或在 `main` 上手动运行 **Release** 工作流。已有标签始终对应原始源码，完整发布的版本不会被覆盖。构建失败时，版本提交保留在 `main`，不会发布缺少产物的 Release。
 

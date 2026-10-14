@@ -13,12 +13,13 @@ Download an archive for your operating system and architecture from [GitHub Rele
 | Platform | Architectures | Archive |
 | --- | --- | --- |
 | Linux (GNU/glibc) | x86_64, ARM64 | `.tar.gz` |
+| Linux (static musl) | x86_64, ARM64 | `.tar.gz` |
 | macOS | Intel x86_64, Apple Silicon ARM64 | `.tar.gz` |
 | Windows (MSVC) | x86_64, ARM64 | `.zip` |
 
-All six builds run on native GitHub-hosted runners. Linux builds use Ubuntu 24.04, so the GNU binaries target systems with glibc 2.39 or newer; build from source for older distributions.
+All eight builds run on native GitHub-hosted runners. Linux GNU builds use Ubuntu 24.04, so those binaries target systems with glibc 2.39 or newer. The musl binaries are statically linked in Alpine containers on matching x86_64/ARM64 runners and do not require glibc; choose them for Alpine or older glibc distributions. The build verifies that musl executables have no dynamic interpreter or shared-library dependencies.
 
-Pushing to `main` automatically runs [release-plz](https://release-plz.dev/) to update the version and `CHANGELOG.md`, then commits those changes as `github-actions[bot]`. After formatting, Clippy, release compilation, and an executable version check pass on all six platforms, the workflow creates a `v<version>` tag and publishes a GitHub Release with the complete set of archives and checksums. There is no manual release PR and no crates.io publication. Versions follow release-plz's commit analysis; use Conventional Commits such as `fix: ...`, `feat: ...`, and `feat!: ...` to communicate the change.
+Pushing to `main` automatically runs [release-plz](https://release-plz.dev/) to update the version and `CHANGELOG.md`, then commits those changes as `github-actions[bot]`. After formatting, Clippy, release compilation, and an executable version check pass for all eight targets, the workflow creates a `v<version>` tag and publishes a GitHub Release with the complete set of archives and checksums. There is no manual release PR and no crates.io publication. Versions follow release-plz's commit analysis; use Conventional Commits such as `fix: ...`, `feat: ...`, and `feat!: ...` to communicate the change.
 
 The workflow uses the built-in `GITHUB_TOKEN`; no additional secrets are required. `main` must allow the workflow's version commit. Its token-generated push does not start another workflow. Releases run serially; queued runs use the latest `main`, so closely spaced pushes can be included in one release. To retry an interrupted release, rerun the failed jobs or manually run the **Release** workflow on `main`. Existing tags keep their original source, and complete releases are not overwritten. Build failures leave the version commit on `main`, without publishing an incomplete release.
 
