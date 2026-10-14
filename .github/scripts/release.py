@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tomllib
@@ -78,7 +79,43 @@ def tag_commit(tag):
 
 
 def prepare():
-    run("release-plz", "update", "--config", "release-plz.toml")
+    if run("git", "status", "--porcelain", capture=True):
+        raise SystemExit("Release preparation requires a clean working tree")
+
+    current_version = version()
+    changelog = Path("CHANGELOG.md")
+    original_changelog = None
+    if not tag_commit(f"v{current_version}") and changelog.exists():
+        original = changelog.read_bytes()
+        headings = list(re.finditer(rb"(?m)^##[ \t]+[^\r\n]*(?:\r?\n|$)", original))
+        pending_heading = re.compile(
+            rb"^##[ \t]+\[" + re.escape(current_version.encode("utf-8"))
+            + rb"\](?=[ \t(\r\n]|$)"
+        )
+        sections = [
+            (heading.start(), headings[index + 1].start() if index + 1 < len(headings) else len(original))
+            for index, heading in enumerate(headings)
+            if pending_heading.match(heading.group())
+        ]
+        if sections:
+            # release-plz preserves an existing entry for the manifest's version,
+            # even before its tag exists. Remove only that pending entry so a
+            # cancelled preparation followed by more commits gets fresh notes.
+            original_changelog = original
+            refreshed = original
+            for start, end in reversed(sections):
+                refreshed = refreshed[:start] + refreshed[end:]
+    try:
+        arguments = ["release-plz", "update", "--config", "release-plz.toml"]
+        if original_changelog is not None:
+            changelog.write_bytes(refreshed)
+            arguments.append("--allow-dirty")
+        run(*arguments)
+    except BaseException:
+        if original_changelog is not None:
+            changelog.write_bytes(original_changelog)
+        raise
+
     release_version = version()
     tag = f"v{release_version}"
     tracked = [path for path in ("Cargo.toml", "Cargo.lock", "CHANGELOG.md") if Path(path).exists()]

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- include native static musl release archives
 - use native GNU release-plz on Ubuntu runners
 - automate native multi-architecture releases with release-plz
 - Fix systemd unit scalar values and stopped-unit cleanup

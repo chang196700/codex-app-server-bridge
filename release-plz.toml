@@ -4,9 +4,25 @@ git_only = true
 release_always = true
 semver_check = false
 dependencies_update = false
+# An initial release includes the complete repository history.
+max_analyze_commits = 0
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 # Publish only after all native archives and their checksums have been uploaded.
 git_release_draft = true
 git_release_latest = false
 repo_url = "https://github.com/chang196700/codex-app-server-bridge"
+
+[changelog]
+# Refreshing an unpublished version must not turn the previous preparation
+# commit into another changelog entry. Keep the default groups for other commits.
+commit_parsers = [
+    { message = '^chore: release v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$', skip = true },
+    { message = "^feat", group = "added" },
+    { message = "^changed", group = "changed" },
+    { message = "^deprecated", group = "deprecated" },
+    { message = "^removed", group = "removed" },
+    { message = "^fix", group = "fixed" },
+    { message = "^security", group = "security" },
+    { message = ".*", group = "other" },
+]
