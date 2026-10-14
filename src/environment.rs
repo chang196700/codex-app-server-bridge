@@ -535,13 +535,15 @@ fn session_command() -> std::process::Command {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    if let (Some(uid), Some(manager_uid)) = (uid, manager_uid) {
-        if uid != manager_uid && !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()) {
-            // A LaunchDaemon with UserName= still inherits the system bootstrap
-            // domain. Try the target user's domain without elevating the bridge.
-            // macOS may reject this cross-domain operation; files remain valid.
-            command.args(["asuser", &uid, "/bin/launchctl"]);
-        }
+    if let (Some(uid), Some(manager_uid)) = (uid, manager_uid)
+        && uid != manager_uid
+        && !uid.is_empty()
+        && uid.bytes().all(|b| b.is_ascii_digit())
+    {
+        // A LaunchDaemon with UserName= still inherits the system bootstrap
+        // domain. Try the target user's domain without elevating the bridge.
+        // macOS may reject this cross-domain operation; files remain valid.
+        command.args(["asuser", &uid, "/bin/launchctl"]);
     }
     command
 }
