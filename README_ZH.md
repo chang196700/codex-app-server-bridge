@@ -4,7 +4,7 @@
 
 使用 Rust 监控 `$CODEX_HOME/app-server-control/app-server-control.sock`，将 Codex 的本地控制连接转发为 `ws://127.0.0.1:<端口>/`。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
 
-支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。程序不会启动 Codex，也不会创建、删除或替换 Codex 的 socket。
+支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。可选开启在 Codex app-server daemon 未运行时自动启动，默认关闭。桥接本身不会创建、删除或替换 Codex 的 socket。
 
 ## 下载与自动发布
 
@@ -109,6 +109,10 @@ codex-app-server-bridge --config /path/to/bridge.toml run
 # 通常不需要配置；默认拼接 codex_home 下的控制 socket 路径
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 
+auto_start_codex_app_server_daemon = false  # daemon 未运行时自动启动，默认关闭
+# 可选；省略时从 PATH 和常见安装位置自动检测 Codex
+# codex_path = "/absolute/path/to/codex"
+
 host = "127.0.0.1"             # 也可使用 ::1；只接受 loopback 地址
 port = 0                       # 0 为动态端口；例如 8765 为固定端口
 poll_interval_ms = 2000         # socket 健康检查间隔，至少 100 毫秒
@@ -129,6 +133,7 @@ publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 tru
 | 用户主目录 | `--user-home` → TOML `user_home` → 操作系统当前用户主目录 |
 | Codex 目录 | `--codex-home` → TOML `codex_home` → 环境变量 `CODEX_HOME` → 所选用户主目录下的 `.codex` |
 | socket 路径 | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
+| Codex 执行文件 | TOML `codex_path` → 从 `PATH` 和常见安装位置自动检测 |
 | 端口 | `--port` → TOML `port` → `0` |
 
 TOML 中的 `user_home` 在读取配置后生效，不会改变已经选定的配置文件路径。路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。TOML 未知字段会报错，避免拼写错误被忽略。
@@ -141,6 +146,12 @@ codex-app-server-bridge config get port
 codex-app-server-bridge config set port 8765
 codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
+codex-app-server-bridge config get auto_start_codex_app_server_daemon
+codex-app-server-bridge config get codex_path
+
+# 可选：指定执行文件；使用自动检测时省略这条命令
+codex-app-server-bridge config set codex_path /absolute/path/to/codex
+codex-app-server-bridge config set auto_start_codex_app_server_daemon true
 
 # 查看或修改自定义配置文件
 codex-app-server-bridge --config /path/to/bridge.toml config get port
@@ -154,6 +165,20 @@ codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
 配置键支持使用点分路径导航。当前配置结构只有顶层字段，因此直接使用 `port`、`socket_path` 等字段名；目前没有可通过点分路径访问的嵌套配置项。未知字段或子键会被拒绝。
 
 修改配置不会使运行中的实例自动重新加载。前台进程需要重启；已安装的服务需要重新执行相同的 `service install` 命令，更新 `<state_dir>/service.toml` 并重启服务。单独执行 `service start` 仍会使用原有快照。
+
+## 自动启动 Codex daemon
+
+设置 `auto_start_codex_app_server_daemon = true` 后，桥接会在 Codex app-server daemon 未运行时自动启动它；此选项默认关闭。开启后，桥接会在启动 daemon 前按需创建缺失的 `CODEX_HOME` 目录；关闭时不会创建该目录。需要安装支持 `codex app-server daemon start` 的 Codex CLI，该命令已在 Codex CLI 0.162.1 上检查。应使用完整 Codex CLI 安装中的执行文件；只复制单个程序文件，可能无法准备 daemon 所需的包。
+
+桥接复用现有 socket 健康检查，daemon 正常时保持运行。仅在连接 socket 返回 `NotFound` 或 `ConnectionRefused` 时，后台任务使用所选 `CODEX_HOME` 执行幂等的 `codex app-server daemon start` 命令。权限错误、WebSocket 握手失败、超时不会触发启动。启动任务不会阻塞 WebSocket 监听，失败会记录日志，并按 5 秒起、最长 60 秒的指数退避间隔重试。停止桥接不会停止独立运行的 Codex daemon。
+
+省略 `codex_path` 时会从 `PATH` 和常见安装位置自动检测，也可以配置 Codex 执行文件路径；绝对路径、开头的 `~` 和相对路径遵循上文的配置路径规则。开启自动启动后，`service install` 会解析执行文件，将绝对路径写入 `<state_dir>/service.toml`，不修改原始配置。更改开关、执行文件路径或 Codex 安装位置后，需要再次运行 `service install` 更新快照。
+
+Unix 上通过 npm 安装的启动器还要求服务的 `PATH` 能找到 Node。桥接会将所选 Codex 执行文件的目录加入启动命令的 `PATH`，支持 nvm 等将 `node` 与 `codex` 放在同一目录的安装方式。如果该目录和服务原有的 `PATH` 都找不到 Node，请将 `codex_path` 指向完整 Codex 包中的原生执行文件。
+
+自动启动只支持标准的 `<codex_home>/app-server-control/app-server-control.sock`。可以通过 `codex_home` 或 `--codex-home` 更改 Codex 数据目录，但不能与指向其他位置的 `socket_path` 组合使用。
+
+Windows 自动启动 daemon 仅支持普通、未提升权限的用户进程：请在普通 PowerShell 中前台运行，或执行 `service install --scope user`。Codex 会拒绝提升权限进程和 LocalSystem 启动 daemon，因此开启此选项时安装 Windows `--scope system` 服务会明确报错。关闭此选项后，Windows 系统服务仍可桥接已经运行的 daemon。Linux 和 macOS 的系统服务以指定的 `--username` 身份运行，可以使用自动启动功能。
 
 ## 环境变量如何生效
 
@@ -202,6 +227,8 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 安装目录由所选 `user_home` 决定，不随 `--config` 的位置改变。安装不会自动将目录加入 `PATH`，后续可使用安装副本的完整路径执行命令。从安装副本本身执行 `service install` 时会跳过自复制，更新配置及启动注册；安装副本可以通过 `update` 获取新版本。
 
 `service install` 会注册并立即启动；重复安装会更新配置并重新启动。安装将当前有效配置保存到 `<state_dir>/service.toml`，后台进程读取此快照。修改原始配置、端口或 `CODEX_HOME` 后，需要再次运行 `service install` 才会应用；单独 `service start` 不会重新生成快照。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
+
+Linux 生成的 systemd unit 停止时仅终止桥接进程，因此停止或重启桥接服务会保留独立运行的 Codex daemon。
 
 ### Windows：当前用户登录启动
 

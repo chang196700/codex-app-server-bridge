@@ -868,8 +868,11 @@ mod platform {
                 } else {
                     "multi-user.target"
                 };
+                // Codex detaches its daemon with setsid but stays in the unit's
+                // cgroup. Stop only the bridge so service updates/restarts do
+                // not terminate the independently managed Codex daemon.
                 let content = format!(
-                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nEnvironment={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
+                    "# {MANAGED_MARKER}\n[Unit]\nDescription=Codex app-server WebSocket bridge\nAfter=network.target\n\n[Service]\nType=exec\n{identity}ExecStart={}\nEnvironment={}\nEnvironment={}\nRestart=on-failure\nRestartSec=3\nKillMode=process\nTimeoutStopSec=30\nUMask=0077\n\n[Install]\nWantedBy={target}\n",
                     command.join(" "),
                     quote(&format!("HOME={}", path_text(&options.user_home)?), false),
                     quote(

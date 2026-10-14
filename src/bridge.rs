@@ -166,6 +166,11 @@ where
 }
 
 async fn probe(settings: &Settings) -> Result<()> {
+    // Winsock can report WSAENETDOWN for a nonexistent AF_UNIX path. A
+    // filesystem check preserves NotFound without guessing from that code,
+    // while access-denied errors remain distinct from a stopped daemon.
+    #[cfg(windows)]
+    tokio::fs::metadata(&settings.socket_path).await?;
     let mut ws = upstream(settings).await?;
     timeout(settings.timeout(), async {
         ws.close(None).await?;
@@ -260,6 +265,8 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
         environment_rx,
     ));
     let (health_tx, mut health_rx) = watch::channel(false);
+    let (daemon_tx, daemon_rx) = watch::channel(crate::daemon::State::Unavailable);
+    let daemon_task = tokio::spawn(crate::daemon::run(settings.clone(), daemon_rx));
     let health_settings = settings.clone();
     let monitor = tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(
@@ -269,6 +276,7 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
         loop {
             ticker.tick().await;
             let health = probe(&health_settings).await;
+            daemon_tx.send_replace(crate::daemon::State::from_probe(&health));
             if let Err(error) = &health {
                 tracing::debug!(%error, "control socket probe failed");
             }
@@ -325,6 +333,8 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
     }.await;
     monitor.abort();
     let _ = monitor.await;
+    daemon_task.abort();
+    let _ = daemon_task.await;
     ready.store(false, Ordering::Release);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}

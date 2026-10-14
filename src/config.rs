@@ -12,6 +12,10 @@ pub const EXAMPLE: &str = r#"# ~/.codex-app-server-bridge/config.toml
 # Defaults to $CODEX_HOME, otherwise ~/.codex.
 # codex_home = "~/.codex"
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
+# Opt in to starting the Codex app-server daemon when it is not running.
+auto_start_codex_app_server_daemon = false
+# Optional Codex executable; otherwise discover it from PATH/common install locations.
+# codex_path = "/absolute/path/to/codex"
 
 # Only loopback addresses are accepted. Use an SSH tunnel for remote access.
 host = "127.0.0.1"
@@ -31,6 +35,8 @@ publish_codex_app_server_ws_url_environment = false
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub codex_home: Option<PathBuf>,
+    pub codex_path: Option<PathBuf>,
+    pub auto_start_codex_app_server_daemon: bool,
     pub socket_path: Option<PathBuf>,
     pub user_home: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
@@ -48,6 +54,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             codex_home: None,
+            codex_path: None,
+            auto_start_codex_app_server_daemon: false,
             socket_path: None,
             user_home: None,
             state_dir: None,
@@ -125,6 +133,14 @@ impl Settings {
                 .unwrap_or(&user_home.join(".codex")),
             &user_home,
         )?;
+        if let Some(path) = &config.codex_path {
+            if path.as_os_str().is_empty() {
+                bail!(
+                    "codex_path must be a nonempty executable path; omit it for automatic detection"
+                );
+            }
+            config.codex_path = Some(absolute(path, &user_home)?);
+        }
         let socket_path = absolute(
             config
                 .socket_path
@@ -132,6 +148,13 @@ impl Settings {
                 .unwrap_or(&codex_home.join("app-server-control/app-server-control.sock")),
             &user_home,
         )?;
+        if config.auto_start_codex_app_server_daemon
+            && socket_path != codex_home.join("app-server-control/app-server-control.sock")
+        {
+            bail!(
+                "automatic daemon startup requires the default control socket under codex_home; remove the socket_path override"
+            );
+        }
         let state_dir = absolute(
             config
                 .state_dir

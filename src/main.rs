@@ -1,6 +1,8 @@
 mod bridge;
+mod codex_path;
 mod config;
 mod config_command;
+mod daemon;
 mod environment;
 mod service;
 mod socket;
@@ -226,6 +228,15 @@ fn main() -> Result<()> {
             scope,
             username,
         } => {
+            #[cfg(windows)]
+            if matches!(action, service::Action::Install)
+                && matches!(scope, service::Scope::System)
+                && settings.config.auto_start_codex_app_server_daemon
+            {
+                anyhow::bail!(
+                    "Codex daemon auto-start requires a non-elevated user; use `service install --scope user` or disable auto_start_codex_app_server_daemon for a Windows system service"
+                );
+            }
             #[cfg(unix)]
             if matches!(action, service::Action::Install)
                 && matches!(scope, service::Scope::System)
@@ -237,6 +248,15 @@ fn main() -> Result<()> {
             }
             let snapshot = settings.state_dir.join("service.toml");
             if matches!(action, service::Action::Install) {
+                if settings.config.auto_start_codex_app_server_daemon {
+                    daemon::check_launch_context()?;
+                    // Service managers may have a minimal PATH. Save the
+                    // detected stable launcher path in the snapshot only.
+                    settings.config.codex_path = Some(codex_path::resolve(
+                        settings.config.codex_path.as_deref(),
+                        &settings.user_home,
+                    )?);
+                }
                 // The stable executable always lives in the selected user's
                 // default directory, even when --config selects another file.
                 let default_config = config::resolve_config_path(None, Some(&settings.user_home))?;

@@ -4,7 +4,7 @@ English | [简体中文](README_ZH.md)
 
 A Rust program that monitors `$CODEX_HOME/app-server-control/app-server-control.sock` and exposes the local Codex control connection at `ws://127.0.0.1:<port>/`. It can optionally set the user environment variable `CODEX_APP_SERVER_WS_URL`; this is disabled by default.
 
-Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. The program does not start Codex or create, delete, or replace its socket.
+Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. It can optionally start the Codex app-server daemon when it is not running; this is disabled by default. The bridge never creates, deletes, or replaces Codex's socket itself.
 
 ## Downloads and automatic releases
 
@@ -109,6 +109,10 @@ If `~/.codex-app-server-bridge` is still a legacy TOML file, selecting the defau
 # Usually unnecessary; defaults to the control socket path under codex_home
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 
+auto_start_codex_app_server_daemon = false  # Start an unavailable daemon; disabled by default
+# Optional; omit to find Codex on PATH or in common installation locations
+# codex_path = "/absolute/path/to/codex"
+
 host = "127.0.0.1"             # ::1 is also supported; only loopback addresses are accepted
 port = 0                       # 0 selects a dynamic port; e.g. 8765 selects a fixed port
 poll_interval_ms = 2000         # Socket health check interval; at least 100 ms
@@ -129,6 +133,7 @@ Configuration precedence:
 | User home directory | `--user-home` → TOML `user_home` → the current OS user's home directory |
 | Codex directory | `--codex-home` → TOML `codex_home` → the `CODEX_HOME` environment variable → `.codex` in the selected user's home directory |
 | Socket path | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
+| Codex executable | TOML `codex_path` → automatic detection on `PATH` and in common installation locations |
 | Port | `--port` → TOML `port` → `0` |
 
 A TOML `user_home` value takes effect after the configuration is read; it does not change which configuration file is selected. A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. Unknown TOML fields are rejected so that typos are not silently ignored.
@@ -141,6 +146,12 @@ codex-app-server-bridge config get port
 codex-app-server-bridge config set port 8765
 codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
+codex-app-server-bridge config get auto_start_codex_app_server_daemon
+codex-app-server-bridge config get codex_path
+
+# Optional explicit executable; omit this command to use automatic detection
+codex-app-server-bridge config set codex_path /absolute/path/to/codex
+codex-app-server-bridge config set auto_start_codex_app_server_daemon true
 
 # Read or edit a custom configuration file
 codex-app-server-bridge --config /path/to/bridge.toml config get port
@@ -154,6 +165,20 @@ codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
 Configuration keys support dot-separated path navigation. The current schema has only top-level fields, so use names such as `port` and `socket_path`; there are no nested settings to address yet. Unknown fields or subkeys are rejected.
 
 Configuration changes do not reload a running instance. Restart a foreground process to apply them. For an installed service, rerun the same `service install` command to refresh `<state_dir>/service.toml` and restart the service; `service start` alone keeps using the existing snapshot.
+
+## Start the Codex daemon automatically
+
+Set `auto_start_codex_app_server_daemon = true` to let the bridge start an unavailable Codex app-server daemon. The option defaults to `false`. When enabled, the bridge creates a missing `CODEX_HOME` directory as needed before starting the daemon; it does not create that directory when the option is disabled. Install a Codex CLI version that supports `codex app-server daemon start`; the command has been checked with Codex CLI 0.162.1. Use the executable from a complete Codex CLI installation: copying only a standalone executable may leave it unable to prepare the daemon package.
+
+The bridge uses its existing socket health check. A healthy daemon is left running. If connecting to the socket returns `NotFound` or `ConnectionRefused`, a background worker runs the idempotent `codex app-server daemon start` command with the selected `CODEX_HOME`. Permission errors, failed WebSocket handshakes, and timeouts do not trigger a start. Startup attempts do not block the WebSocket listener; failures are logged and retried with an exponential delay from 5 to 60 seconds. Stopping the bridge does not stop the independent Codex daemon.
+
+Omit `codex_path` to search `PATH` and common installation locations, or set it to the Codex executable's path. Absolute paths, a leading `~`, and relative paths follow the configuration path rules above. When automatic daemon startup is enabled, `service install` resolves the executable and saves its absolute path in `<state_dir>/service.toml`, without changing the original configuration. After changing the option, executable path, or Codex installation location, rerun `service install` to refresh this snapshot.
+
+On Unix, an npm-installed launcher also needs Node on the service's `PATH`. The bridge adds the selected Codex executable's directory to the startup command's `PATH`, supporting installations such as nvm that keep `node` alongside `codex`. If Node is unavailable there or on the service's existing `PATH`, set `codex_path` to the native executable within the complete Codex package.
+
+Automatic startup requires the standard `<codex_home>/app-server-control/app-server-control.sock` socket. You can select another Codex data directory with `codex_home` or `--codex-home`, but cannot combine automatic startup with a different `socket_path`.
+
+On Windows, automatic daemon startup requires an ordinary, non-elevated user process; use foreground mode or `service install --scope user` from a normal PowerShell session. Codex rejects daemon startup from elevated processes and LocalSystem. Installing a Windows `--scope system` service with automatic startup enabled is therefore rejected. A Windows system service can still bridge a daemon that is already running when this option is disabled. Linux and macOS system services run as the specified `--username` and can use automatic daemon startup.
 
 ## How environment updates work
 
@@ -202,6 +227,8 @@ Native Windows services run in Session 0, so their environment change broadcasts
 The installation directory follows the selected `user_home`, regardless of where `--config` points. Installation does not add the directory to `PATH`; use the installed executable's full path for later commands if needed. Running `service install` from the installed copy skips copying the executable onto itself and updates the configuration and startup registration. The installed copy can fetch a newer version with `update`.
 
 `service install` registers and immediately starts the service or startup entry. Running it again updates the configuration and restarts the instance. Installation saves the effective configuration to `<state_dir>/service.toml`, which the background process reads. Changes to the original configuration, port, or `CODEX_HOME` require another `service install` to take effect; `service start` alone does not regenerate the snapshot. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
+
+On Linux, the generated systemd unit stops only the bridge process, preserving the independent Codex daemon across bridge stops and restarts.
 
 ### Windows: start at user login
 
