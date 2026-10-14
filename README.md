@@ -1,130 +1,132 @@
 # codex-app-server-bridge
 
-使用 Rust 监控 `$CODEX_HOME/app-server-control/app-server-control.sock`，将 Codex 的本地控制连接转发为 `ws://127.0.0.1:<端口>/`。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
+English | [简体中文](README_ZH.md)
 
-支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。程序不会启动 Codex，也不会创建、删除或替换 Codex 的 socket。
+A Rust program that monitors `$CODEX_HOME/app-server-control/app-server-control.sock` and exposes the local Codex control connection at `ws://127.0.0.1:<port>/`. It can optionally set the user environment variable `CODEX_APP_SERVER_WS_URL`; this is disabled by default.
 
-## 构建与运行
+Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. The program does not start Codex or create, delete, or replace its socket.
 
-安装 Rust / rustup 和当前平台的 Rust 原生构建工具。工具链版本由仓库中的 `rust-toolchain.toml` 确定。
+## Build and run
+
+Install Rust / rustup and the native Rust build tools for your platform. The repository's `rust-toolchain.toml` specifies the toolchain version.
 
 ```sh
 cargo build --release --locked
 ```
 
-构建产物为 `target/release/codex-app-server-bridge`；Windows 为同目录下的 `codex-app-server-bridge.exe`。以下命令假设程序已加入 `PATH`；也可以直接使用产物的绝对路径。
+The executable is `target/release/codex-app-server-bridge`, or `codex-app-server-bridge.exe` in the same directory on Windows. The commands below assume it is on `PATH`; you can also use its absolute path.
 
 ```sh
-# 创建示例配置，已有文件不会被覆盖
+# Create an example configuration without overwriting an existing file
 codex-app-server-bridge init-config
 
-# 前台运行；不带子命令也等同于 run
+# Run in the foreground; omitting the subcommand also runs the bridge
 codex-app-server-bridge run
 
-# 查看实际端口、socket 路径、PID 和就绪状态
+# Show the actual port, socket path, PID, and readiness
 codex-app-server-bridge status
 ```
 
-启动时 socket 尚不存在也可以：桥接会保持运行并定期尝试连接。前台使用 `Ctrl+C` 退出。
+The socket does not need to exist at startup: the bridge stays running and periodically attempts to connect. Press `Ctrl+C` to stop a foreground instance.
 
 ```sh
-# 固定端口；端口被占用会报错退出，不会悄悄改用其他端口
+# Fixed port; exits with an error if occupied, without switching ports
 codex-app-server-bridge --port 8765 run
 
-# 动态分配一个可用端口
+# Choose an available port dynamically
 codex-app-server-bridge --port 0 run
 
-# 指定 Codex 数据目录或配置文件
+# Specify the Codex data directory or configuration file
 codex-app-server-bridge --codex-home /path/to/.codex run
 codex-app-server-bridge --config /path/to/bridge.toml run
 ```
 
-动态端口在一次运行期间保持不变；桥接进程重启后可能变化。只重启 Codex、重新创建 socket，不会使仍在运行的桥接更换监听端口。
+A dynamic port stays unchanged for the lifetime of the bridge process and may change after the bridge restarts. Restarting only Codex or recreating its socket does not change the port of a running bridge.
 
-## 配置
+## Configuration
 
-默认配置为 `~/.codex-app-server-bridge`：这是一个**没有扩展名的 TOML 文件**，不是目录。Windows 中 `~` 对应当前用户主目录。默认文件不存在时使用内置配置；显式 `--config` 指定的文件不存在则报错。
+The default configuration is `~/.codex-app-server-bridge`: a **TOML file with no extension**, not a directory. On Windows, `~` refers to the current user's home directory. Built-in defaults apply if the default file does not exist; a missing file explicitly selected with `--config` is an error.
 
 ```toml
-# 可省略；默认使用 CODEX_HOME，未设置时使用 ~/.codex
+# Optional; defaults to CODEX_HOME, or ~/.codex if unset
 # codex_home = "~/.codex"
 
-# 通常不需要配置；默认拼接 codex_home 下的控制 socket 路径
+# Usually unnecessary; defaults to the control socket path under codex_home
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 
-host = "127.0.0.1"             # 也可使用 ::1；只接受 loopback 地址
-port = 0                       # 0 为动态端口；例如 8765 为固定端口
-poll_interval_ms = 2000         # socket 健康检查间隔，至少 100 毫秒
-connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
+host = "127.0.0.1"             # ::1 is also supported; only loopback addresses are accepted
+port = 0                       # 0 selects a dynamic port; e.g. 8765 selects a fixed port
+poll_interval_ms = 2000         # Socket health check interval; at least 100 ms
+connect_timeout_ms = 3000       # Connection and handshake timeout; at least 100 ms
 max_connections = 64
-max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
-publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 true 自动设置用户环境变量
+max_message_size = 67108864     # Bridge message/frame limit; Codex upstream limits still apply
+publish_codex_app_server_ws_url_environment = false  # Disabled by default; true enables automatic user environment updates
 
-# 必须使用本程序专用的状态目录
+# Use a state directory dedicated to this program
 # state_dir = "~/.local/state/codex-app-server-bridge"
 ```
 
-配置优先级：
+Configuration precedence:
 
-| 项目 | 优先级，从高到低 |
+| Setting | Priority, highest first |
 | --- | --- |
-| 配置文件 | `--config`；否则所选用户主目录下的 `.codex-app-server-bridge` |
-| 用户主目录 | `--user-home` → TOML `user_home` → 操作系统当前用户主目录 |
-| Codex 目录 | `--codex-home` → TOML `codex_home` → 环境变量 `CODEX_HOME` → 所选用户主目录下的 `.codex` |
-| socket 路径 | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
-| 端口 | `--port` → TOML `port` → `0` |
+| Configuration file | `--config`; otherwise `.codex-app-server-bridge` in the selected user's home directory |
+| User home directory | `--user-home` → TOML `user_home` → the current OS user's home directory |
+| Codex directory | `--codex-home` → TOML `codex_home` → the `CODEX_HOME` environment variable → `.codex` in the selected user's home directory |
+| Socket path | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
+| Port | `--port` → TOML `port` → `0` |
 
-路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。TOML 未知字段会报错，避免拼写错误被忽略。
+A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. Unknown TOML fields are rejected so that typos are not silently ignored.
 
-## 环境变量如何生效
+## How environment updates work
 
-自动设置环境变量**默认关闭**，省略 `publish_codex_app_server_ws_url_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
+Automatic environment updates are **disabled by default**, including when `publish_codex_app_server_ws_url_environment` is omitted. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
 
-已有配置若使用旧名称 `publish_environment`，请将其替换为 `publish_codex_app_server_ws_url_environment`；已安装的服务还需重新运行 `service install` 更新配置快照。
+If an existing configuration uses the old name `publish_environment`, replace it with `publish_codex_app_server_ws_url_environment`. For an installed service, also rerun `service install` to update its configuration snapshot.
 
-需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge` 中开启：
+To set `CODEX_APP_SERVER_WS_URL` automatically, enable this option in `~/.codex-app-server-bridge`:
 
 ```toml
 publish_codex_app_server_ws_url_environment = true
 ```
 
-修改后重启前台进程；已安装服务则重新运行相同的 `service install` 命令，使配置快照更新并重启。要关闭已开启的发布功能，先停止原进程，让它清理自己发布的变量，再设为 `false` 并启动或重新安装服务。
+After changing it, restart the foreground process. For an installed service, rerun the same `service install` command to update the configuration snapshot and restart the service. To disable an enabled publisher, first stop the old process so it can remove the variable it published, then set the option to `false` and start the bridge or reinstall the service.
 
-以下发布行为仅在开启时生效：桥接完成 socket 连接和 WebSocket 健康检查后才发布 URL。socket 失联时撤回自己发布的变量，恢复后重新发布；正常退出时也会清理。清理会核对原值，保留用户或其他程序后来写入的不同值。
+The following behavior applies only when publication is enabled. The bridge publishes the URL after connecting to the socket and completing a WebSocket health check. If the socket becomes unavailable, it withdraws the variable it published and republishes it when the socket recovers. It also cleans up on normal exit. Cleanup checks the existing value and preserves a different value subsequently written by the user or another program.
 
-| 平台 | 发布方式 |
+| Platform | Publication method |
 | --- | --- |
-| Windows | 当前用户或服务安装时记录的目标用户 SID 对应的注册表 `Environment` 项，并尝试发送环境变更通知 |
-| Linux | 状态目录下的 `environment.sh`、用户 `~/.config/environment.d/90-codex-app-server-bridge.conf`，以及可访问时的 systemd 用户管理器环境 |
-| macOS | 状态目录下的 `environment.sh`，以及可访问时的目标用户 launchd 环境 |
+| Windows | The registry `Environment` key for the current user, or for the target user SID recorded during service installation, followed by an attempt to broadcast an environment change notification |
+| Linux | `environment.sh` in the state directory, the user's `~/.config/environment.d/90-codex-app-server-bridge.conf`, and the systemd user manager's environment when accessible |
+| macOS | `environment.sh` in the state directory and the target user's launchd environment when accessible |
 
-Unix 平台会在 `.profile`、`.zprofile`，以及已经存在的 `.bash_profile` / `.bash_login` 中维护带标记的加载段。不会为此新建 `.bash_profile`，也不会改写无关配置。使用 sh、Bash 或 Zsh 的现有终端、非登录 shell 可以显式加载：
+On Unix, the program maintains marked source blocks in `.profile`, `.zprofile`, and any existing `.bash_profile` / `.bash_login`. It does not create `.bash_profile` for this purpose or alter unrelated configuration. Existing terminals and non-login shells using sh, Bash, or Zsh can load the file explicitly:
 
 ```sh
-# Linux/macOS，默认状态目录；自定义 state_dir 时相应调整
+# Linux/macOS, with the default state directory; adjust for a custom state_dir
 . "$HOME/.local/state/codex-app-server-bridge/environment.sh"
 printf '%s\n' "$CODEX_APP_SERVER_WS_URL"
 ```
 
-Windows 当前 PowerShell 可以从用户注册表重新读取：
+An existing Windows PowerShell session can reread the value from the user registry:
 
 ```powershell
 $env:CODEX_APP_SERVER_WS_URL = [Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'User')
 ```
 
-**已有终端和应用的环境不会被外部进程直接改变。** 已经启动的客户端需要重新加载环境或重启；socket 离线后，旧进程中继承的变量也不会自动消失。Unix 的 `environment.sh` 只有在 URL 发布期间存在，离线时不要将旧 shell 变量当作实时状态；可运行 `status` 确认。
+**An external process cannot directly change the environment of an existing terminal or application.** Clients that are already running must reload their environment or restart. An inherited variable also remains in an existing process after the socket goes offline. On Unix, `environment.sh` exists only while the URL is published. Do not treat a stale shell variable as current status when the socket is offline; use `status` to check.
 
-Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另一会话中的 Explorer。注册表仍会更新；当前会话需要主动读取变量，或重新登录后继承。macOS 系统服务虽按目标用户身份运行，其 launchd 域仍可能限制 GUI 环境更新；这类失败会记录日志，shell 环境文件仍可使用。Linux 用户管理器尚未启动等情况也会记录日志，并在后续健康检查中重试会话环境发布。
+Native Windows services run in Session 0, so their environment change broadcasts cannot refresh Explorer in another session. The registry is still updated; the current session must explicitly read the variable, or inherit it after signing in again. Although a macOS system service runs as the target user, its launchd domain may still restrict GUI environment updates. Such failures are logged, and the shell environment file remains available. Conditions such as a Linux user manager that has not yet started are also logged, and session environment publication is retried during subsequent health checks.
 
-## 安装服务或开机启动
+## Install a service or enable startup
 
-先将二进制放到长期保留的位置，再安装。安装记录的是**当前二进制绝对路径**；安装后不要移动、删除它，也不要清理对应构建目录。需要更换位置时，从新位置重新安装。
+Place the executable in a permanent location before installing. Installation records the **absolute path of the current executable**. Do not move or delete it afterward, or clean the build directory containing it. To use a different location, reinstall from the new location.
 
-`service install` 会注册并立即启动；重复安装会更新配置并重新启动。安装将当前有效配置保存到 `<state_dir>/service.toml`，后台进程读取此快照。修改原始配置、端口或 `CODEX_HOME` 后，需要再次运行 `service install` 才会应用；单独 `service start` 不会重新生成快照。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
+`service install` registers and immediately starts the service or startup entry. Running it again updates the configuration and restarts the instance. Installation saves the effective configuration to `<state_dir>/service.toml`, which the background process reads. Changes to the original configuration, port, or `CODEX_HOME` require another `service install` to take effect; `service start` alone does not regenerate the snapshot. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
 
-### Windows：当前用户登录启动
+### Windows: start at user login
 
-在目标用户的普通 PowerShell 中执行，不需要管理员权限。此方式写入当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，下次登录后启动隐藏的后台进程。
+Run these commands in a normal PowerShell session as the target user; administrator privileges are not required. This writes to the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` and starts a hidden background process at the next login.
 
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
@@ -135,11 +137,11 @@ $bridge = 'C:\Tools\codex-app-server-bridge.exe'
 & $bridge service uninstall --scope user
 ```
 
-Run 启动命令超过 260 个 UTF-16 字符时安装会明确失败；请使用更短的二进制/状态目录路径，或选择系统服务。`stop` 会请求正常退出并等待实例锁释放，不使用强制结束进程。
+Installation explicitly fails if the Run command exceeds 260 UTF-16 characters. Use shorter executable and state directory paths, or choose a system service. `stop` requests a graceful exit and waits for the instance lock to be released; it does not forcibly terminate the process.
 
-### Windows：原生系统服务
+### Windows: native system service
 
-在**目标用户本人提升权限的管理员 PowerShell**中执行，避免使用另一个管理员账户安装。安装会记录当前用户 SID；服务由 SCM 以 `LocalSystem` 运行，环境变量写入记录的用户，而不是 LocalSystem 自己的用户环境。
+Run these commands in an **elevated administrator PowerShell session belonging to the target user**. Avoid installing as a different administrator account. Installation records the current user's SID. SCM runs the service as `LocalSystem`, and environment updates target the recorded user rather than LocalSystem's own user environment.
 
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
@@ -150,11 +152,11 @@ $bridge = 'C:\Tools\codex-app-server-bridge.exe'
 & $bridge service uninstall --scope system
 ```
 
-将示例用户名和路径替换为真实值。服务名为 `codex-app-server-bridge`，配置为延迟自动启动，异常退出后由 SCM 尝试重新启动。Windows 的 `--username` 不适用。
+Replace the example username and paths with your actual values. The service is named `codex-app-server-bridge` and uses delayed automatic startup. SCM attempts to restart it after an unexpected exit. `--username` does not apply on Windows.
 
-### Linux：systemd 用户服务
+### Linux: systemd user service
 
-以目标用户登录后执行：
+Run these commands while logged in as the target user:
 
 ```sh
 codex-app-server-bridge service install --scope user
@@ -164,17 +166,17 @@ codex-app-server-bridge service start --scope user
 codex-app-server-bridge service uninstall --scope user
 ```
 
-服务文件为 `~/.config/systemd/user/codex-app-server-bridge.service`。要在用户尚未登录时也启动用户管理器、并在退出登录后保持运行，由有权限的用户执行：
+The service file is `~/.config/systemd/user/codex-app-server-bridge.service`. To start the user manager before login and keep it running after logout, run the following as a user with the required privileges:
 
 ```sh
 loginctl enable-linger alice
 ```
 
-安装和管理用户服务需要可连接的 systemd 用户管理器；不应以 root 的用户会话替代目标用户执行 `--scope user`。
+Installing and managing a user service requires an accessible systemd user manager. Do not use root's user session as a substitute for the target user when running `--scope user`.
 
-### Linux：systemd 系统服务
+### Linux: systemd system service
 
-系统安装必须明确提供目标用户名、用户主目录。建议同时明确 Codex 目录，以免 `sudo` 改变或清除 `CODEX_HOME`。
+System installation requires an explicit target username and home directory. Specify the Codex directory as well to avoid changes to or removal of `CODEX_HOME` by `sudo`.
 
 ```sh
 sudo /usr/local/bin/codex-app-server-bridge \
@@ -187,11 +189,11 @@ sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home
 sudo /usr/local/bin/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
 ```
 
-服务文件为 `/etc/systemd/system/codex-app-server-bridge.service`。服务进程以 `alice` 的身份运行，需要能够访问二进制、配置快照和 Codex socket。安装会设置专用状态目录及快照的所有者；用户主目录内为此新建的父目录也归目标用户所有。已有父目录的所有者和权限保持不变，不递归更改用户主目录或 Codex 目录权限。用户主目录必须事先存在。
+The service file is `/etc/systemd/system/codex-app-server-bridge.service`. The process runs as `alice` and must be able to access the executable, configuration snapshot, and Codex socket. Installation sets ownership of the dedicated state directory and snapshot. Any parent directories created for this purpose within the user's home also belong to the target user. Existing parent directories retain their ownership and permissions. Installation does not recursively change permissions in the user home or Codex directory. The user's home directory must already exist.
 
-### macOS：登录启动 LaunchAgent
+### macOS: LaunchAgent at login
 
-在目标用户已登录的桌面会话中执行：
+Run these commands in the target user's logged-in desktop session:
 
 ```sh
 codex-app-server-bridge service install --scope user
@@ -201,9 +203,9 @@ codex-app-server-bridge service start --scope user
 codex-app-server-bridge service uninstall --scope user
 ```
 
-配置文件为 `~/Library/LaunchAgents/io.codex.app-server-bridge.plist`，注册到当前用户的 `gui/<uid>` 域。没有 GUI 登录会话时应选择合适的系统服务方式。
+The configuration file is `~/Library/LaunchAgents/io.codex.app-server-bridge.plist`, registered in the current user's `gui/<uid>` domain. Without a GUI login session, use an appropriate system service setup instead.
 
-### macOS：开机启动 LaunchDaemon
+### macOS: LaunchDaemon at boot
 
 ```sh
 sudo /usr/local/bin/codex-app-server-bridge \
@@ -216,28 +218,28 @@ sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-hom
 sudo /usr/local/bin/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
-配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 按指定用户身份运行。用户目录或 Codex socket 在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
+The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`. Its `UserName` setting runs the process as the specified user. If the user directory or Codex socket is unavailable before login, the bridge still depends on those resources becoming available. A LaunchDaemon cannot unlock encrypted user data in advance.
 
-### 卸载与日志
+### Uninstall and logs
 
-`service uninstall` 停止并移除对应启动项。程序二进制、原始 TOML、配置快照和历史日志保留，方便重新安装或排查。正常停止会撤回本实例发布的环境变量；强制终止或断电无法保证立即清理，下次运行会根据记录恢复清理。
+`service uninstall` stops and removes the selected startup entry or service. The executable, original TOML file, configuration snapshot, and historical logs are retained for reinstallation or troubleshooting. A normal stop withdraws environment variables published by this instance. Cleanup cannot be guaranteed immediately after forced termination or a power loss; the next run uses the saved records to resume cleanup.
 
-| 运行方式 | 日志 |
+| Run mode | Logs |
 | --- | --- |
-| 前台 | 标准错误输出 |
-| Windows 后台启动 / 系统服务 | `<state_dir>/logs/bridge.log` |
-| Linux 用户服务 | `journalctl --user -u codex-app-server-bridge -f` |
-| Linux 系统服务 | `sudo journalctl -u codex-app-server-bridge -f` |
-| macOS launchd | `<state_dir>/service.stdout.log` 和 `service.stderr.log` |
+| Foreground | Standard error |
+| Windows background startup / system service | `<state_dir>/logs/bridge.log` |
+| Linux user service | `journalctl --user -u codex-app-server-bridge -f` |
+| Linux system service | `sudo journalctl -u codex-app-server-bridge -f` |
+| macOS launchd | `<state_dir>/service.stdout.log` and `service.stderr.log` |
 
-`status` 检查实例锁并输出运行状态；`service status` 查询操作系统启动项或服务状态。服务处于运行状态并不意味着 Codex socket 已经就绪，仍需查看 `status` 的 `ready` 字段。
+`status` checks the instance lock and reports runtime state. `service status` queries the OS startup entry or service status. A running service does not necessarily mean the Codex socket is ready; check the `ready` field from `status`.
 
-## 协议与访问范围
+## Protocol and access
 
-实现依据 OpenAI Codex 官方 `rust-v0.162.1` 源码：[`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) 在 UDS 上执行 WebSocket 握手，跨平台 UDS 实现在 [`codex-rs/uds/src/lib.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/uds/src/lib.rs)。本桥接因此采用 **WebSocket over TCP ↔ WebSocket over UDS**，不按逐行 JSON 文本解析 socket。
+The implementation follows the official OpenAI Codex `rust-v0.162.1` source: [`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) performs a WebSocket handshake over UDS, and [`codex-rs/uds/src/lib.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/uds/src/lib.rs) provides the cross-platform UDS implementation. This bridge therefore uses **WebSocket over TCP ↔ WebSocket over UDS**. It does not parse the socket as line-delimited JSON.
 
-每个客户端连接对应一个独立的上游连接，转发文本和二进制消息。socket 被关闭或替换时，已有会话可能断开；桥接会重新检测可用性，但客户端仍须自己重连并重新建立所需的 Codex 会话，不会自动重放请求。
+Each client connection has its own upstream connection, forwarding text and binary messages. Existing sessions may disconnect when the socket is closed or replaced. The bridge detects when it becomes available again, but clients must reconnect and reestablish any required Codex session themselves. Requests are not automatically replayed.
 
-只监听 loopback 地址，只接受根路径 `/`，拒绝查询参数和带 `Origin` 的握手；`Host` 必须与发布的 URL 一致。不会转发 `/daemon/shutdown` 等其他路径。浏览器页面连接会被拒绝，应使用原生 WebSocket 客户端。
+The bridge listens only on loopback addresses and accepts only the root path `/`. It rejects query parameters and handshakes containing `Origin`; `Host` must match the published URL. Other paths, such as `/daemon/shutdown`, are not forwarded. Connections from browser pages are rejected; use a native WebSocket client.
 
-桥接没有额外的令牌认证。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对上述 Codex 控制 socket 协议，其他版本若更改握手或协议，需要重新验证。
+The bridge does not add token authentication. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex control socket protocol described above. Other versions require revalidation if they change the handshake or protocol.
