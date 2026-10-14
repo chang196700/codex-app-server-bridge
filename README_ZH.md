@@ -2,9 +2,9 @@
 
 [English](README.md) | 简体中文
 
-使用 Rust 监控 `$CODEX_HOME/app-server-control/app-server-control.sock`，将 Codex 的本地控制连接转发为 `ws://127.0.0.1:<端口>/`。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
+使用 Rust 将 Codex app-server 暴露为 `ws://127.0.0.1:<端口>/`。默认情况下，每个 WebSocket 客户端对应一个 `codex app-server proxy` 子进程，桥接通过 WebSocket 转发 proxy 的 STDIO 字节流，因此不依赖 Codex 的 control socket 路径。也可以选择 `socket` 直连传输以兼容旧方式。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
 
-支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。可选开启在 Codex app-server daemon 未运行时自动启动，默认关闭。桥接本身不会创建、删除或替换 Codex 的 socket。
+支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。可选开启在 Codex app-server daemon 未运行时自动启动，默认关闭。默认 proxy 模式下由 Codex 负责发现和管理 control endpoint。
 
 ## 下载与自动发布
 
@@ -76,11 +76,11 @@ codex-app-server-bridge init-config
 # 前台运行；不带子命令也等同于 run
 codex-app-server-bridge run
 
-# 查看实际端口、socket 路径、PID 和就绪状态
+# 查看实际端口、传输方式、PID 和就绪状态
 codex-app-server-bridge status
 ```
 
-启动时 socket 尚不存在也可以：桥接会保持运行并定期尝试连接。前台使用 `Ctrl+C` 退出。
+启动时 proxy 或 socket endpoint 尚不可用也可以：桥接会保持运行并定期尝试连接。前台使用 `Ctrl+C` 退出。
 
 ```sh
 # 固定端口；端口被占用会报错退出，不会悄悄改用其他端口
@@ -94,7 +94,7 @@ codex-app-server-bridge --codex-home /path/to/.codex run
 codex-app-server-bridge --config /path/to/bridge.toml run
 ```
 
-动态端口在一次运行期间保持不变；桥接进程重启后可能变化。只重启 Codex、重新创建 socket，不会使仍在运行的桥接更换监听端口。
+动态端口在一次运行期间保持不变；桥接进程重启后可能变化。只重启 Codex 或其 proxy endpoint，不会使仍在运行的桥接更换监听端口。
 
 ## 配置
 
@@ -106,7 +106,11 @@ codex-app-server-bridge --config /path/to/bridge.toml run
 # 可省略；默认使用 CODEX_HOME，未设置时使用 ~/.codex
 # codex_home = "~/.codex"
 
-# 通常不需要配置；默认拼接 codex_home 下的控制 socket 路径
+# 默认通过 `codex app-server proxy` 的 STDIO 连接，因此桥接不依赖 Codex 的 control socket 路径。
+# 只有需要直接兼容 control socket 时才设置为 socket。
+transport = "proxy"
+
+# 仅当 transport = "socket" 时使用；默认派生自 codex_home
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 
 auto_start_codex_app_server_daemon = false  # daemon 未运行时自动启动，默认关闭
@@ -115,7 +119,7 @@ auto_start_codex_app_server_daemon = false  # daemon 未运行时自动启动，
 
 host = "127.0.0.1"             # 也可使用 ::1；只接受 loopback 地址
 port = 0                       # 0 为动态端口；例如 8765 为固定端口
-poll_interval_ms = 2000         # socket 健康检查间隔，至少 100 毫秒
+poll_interval_ms = 2000         # 上游健康检查间隔，至少 100 毫秒
 connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
 max_connections = 64
 max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
@@ -132,7 +136,8 @@ publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 tru
 | 配置文件 | `--config`；否则 `--user-home` 或操作系统当前用户主目录下的 `.codex-app-server-bridge/config.toml` |
 | 用户主目录 | `--user-home` → TOML `user_home` → 操作系统当前用户主目录 |
 | Codex 目录 | `--codex-home` → TOML `codex_home` → 环境变量 `CODEX_HOME` → 所选用户主目录下的 `.codex` |
-| socket 路径 | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
+| 上游传输 | TOML `transport` → `proxy`（通过 Codex `app-server proxy` 的 STDIO） |
+| socket 路径 | 仅 `transport = "socket"` 时使用；TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex 执行文件 | TOML `codex_path` → 从 `PATH` 和常见安装位置自动检测 |
 | 端口 | `--port` → TOML `port` → `0` |
 
@@ -145,6 +150,7 @@ codex-app-server-bridge config list
 codex-app-server-bridge config get port
 codex-app-server-bridge config set port 8765
 codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
 codex-app-server-bridge config get codex_path
@@ -162,7 +168,7 @@ codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
 
 `config set KEY VALUE` 接受与字段类型匹配的值。数字和布尔值使用 TOML 语法；路径、`host` 等字符串字段也可直接传入裸字符串，如上方示例。没有用于删除字段的特殊 unset 或 `null` 语法。该命令会创建缺失的配置文件，包括显式 `--config` 指定的文件；保留其他字段和注释，校验完整配置后再写入，并以 JSON 输出保存后的值，不会将运行时覆盖值写回文件。
 
-配置键支持使用点分路径导航。当前配置结构只有顶层字段，因此直接使用 `port`、`socket_path` 等字段名；目前没有可通过点分路径访问的嵌套配置项。未知字段或子键会被拒绝。
+配置键支持使用点分路径导航。当前配置结构只有顶层字段，因此直接使用 `port`、`transport`、`socket_path` 等字段名；目前没有可通过点分路径访问的嵌套配置项。未知字段或子键会被拒绝。
 
 服务直接读取 `config list`、`config get`、`config set` 所选的同一份配置：默认 `~/.codex-app-server-bridge/config.toml`，或安装时通过 `--config` 指定的文件。修改配置不会使运行中的实例自动重新加载。前台进程需要重启；已安装服务执行 `service restart` 即可，操作系统重启服务或重新开机也会应用修改。启动已停止的服务同样会重新读取配置。
 
@@ -181,13 +187,13 @@ codex-app-server-bridge --config /path/to/bridge.toml service restart --scope us
 
 设置 `auto_start_codex_app_server_daemon = true` 后，桥接会在 Codex app-server daemon 未运行时自动启动它；此选项默认关闭。开启后，桥接会在启动 daemon 前按需创建缺失的 `CODEX_HOME` 目录；关闭时不会创建该目录。需要安装支持 `codex app-server daemon start` 的 Codex CLI，该命令已在 Codex CLI 0.162.1 上检查。应使用完整 Codex CLI 安装中的执行文件；只复制单个程序文件，可能无法准备 daemon 所需的包。
 
-桥接复用现有 socket 健康检查，daemon 正常时保持运行。仅在连接 socket 返回 `NotFound` 或 `ConnectionRefused` 时，后台任务使用所选 `CODEX_HOME` 执行幂等的 `codex app-server daemon start` 命令。权限错误、WebSocket 握手失败、超时不会触发启动。启动任务不会阻塞 WebSocket 监听，失败会记录日志，并按 5 秒起、最长 60 秒的指数退避间隔重试。停止桥接不会停止独立运行的 Codex daemon。
+桥接使用所选上游传输的健康检查，daemon 正常时保持运行。proxy 因 daemon 不可用退出，或直连 socket 返回 `NotFound` / `ConnectionRefused` 时，后台任务使用所选 `CODEX_HOME` 执行幂等的 `codex app-server daemon start` 命令。权限错误、协议不匹配和超时不会触发启动。启动任务不会阻塞 WebSocket 监听，失败会记录日志，并按 5 秒起、最长 60 秒的指数退避间隔重试。停止桥接不会停止独立运行的 Codex daemon。
 
 省略 `codex_path` 时会从 `PATH` 和常见安装位置自动检测，也可以配置 Codex 执行文件路径；绝对路径、开头的 `~` 和相对路径遵循上文的配置路径规则。开启自动启动后，`service install` 会解析执行文件，将绝对路径写入所选配置文件，保留注释及其他设置。更改开关、`codex_path` 或 `codex_home` 后，重启桥接服务即可生效；如果 Codex 安装位置改变，应先更新 `codex_path` 再重启。
 
 Unix 上通过 npm 安装的启动器还要求服务的 `PATH` 能找到 Node。桥接会将所选 Codex 执行文件的目录加入启动命令的 `PATH`，支持 nvm 等将 `node` 与 `codex` 放在同一目录的安装方式。如果该目录和服务原有的 `PATH` 都找不到 Node，请将 `codex_path` 指向完整 Codex 包中的原生执行文件。
 
-自动启动只支持标准的 `<codex_home>/app-server-control/app-server-control.sock`。可以通过 `codex_home` 或 `--codex-home` 更改 Codex 数据目录，但不能与指向其他位置的 `socket_path` 组合使用。
+默认 `transport = "proxy"` 时，自动启动不要求桥接知道 daemon 的 socket 路径，由 Codex 自己解析端点。`transport = "socket"` 保留 control socket 直连兼容性；开启自动启动时要求使用 `<codex_home>/app-server-control/app-server-control.sock` 标准路径。
 
 Windows 自动启动 daemon 仅支持普通、未提升权限的用户进程：请在普通 PowerShell 中前台运行，或执行 `service install --scope user`。Codex 会拒绝提升权限进程和 LocalSystem 启动 daemon，因此开启此选项时安装 Windows `--scope system` 服务会明确报错。关闭此选项后，Windows 系统服务仍可桥接已经运行的 daemon。Linux 和 macOS 的系统服务以指定的 `--username` 身份运行，可以使用自动启动功能。
 
@@ -205,7 +211,7 @@ publish_codex_app_server_ws_url_environment = true
 
 修改后重启前台进程，已安装服务执行 `service restart`。要关闭已开启的发布功能，先停止原进程，让它清理自己发布的变量，再设为 `false` 并启动桥接或服务。
 
-以下发布行为仅在开启时生效：桥接完成 socket 连接和 WebSocket 健康检查后才发布 URL。socket 失联时撤回自己发布的变量，恢复后重新发布；正常退出时也会清理。清理会核对原值，保留用户或其他程序后来写入的不同值。
+以下发布行为仅在开启时生效：桥接连接所选上游并完成 WebSocket 健康检查后才发布 URL。上游失联时撤回自己发布的变量，恢复后重新发布；正常退出时也会清理。清理会核对原值，保留用户或其他程序后来写入的不同值。
 
 | 平台 | 发布方式 |
 | --- | --- |
@@ -227,7 +233,7 @@ Windows 当前 PowerShell 可以从用户注册表重新读取：
 $env:CODEX_APP_SERVER_WS_URL = [Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'User')
 ```
 
-**已有终端和应用的环境不会被外部进程直接改变。** 已经启动的客户端需要重新加载环境或重启；socket 离线后，旧进程中继承的变量也不会自动消失。Unix 的 `environment.sh` 只有在 URL 发布期间存在，离线时不要将旧 shell 变量当作实时状态；可运行 `status` 确认。
+**已有终端和应用的环境不会被外部进程直接改变。** 已经启动的客户端需要重新加载环境或重启；上游离线后，旧进程中继承的变量也不会自动消失。Unix 的 `environment.sh` 只有在 URL 发布期间存在，离线时不要将旧 shell 变量当作实时状态；可运行 `status` 确认。
 
 Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另一会话中的 Explorer。注册表仍会更新；当前会话需要主动读取变量，或重新登录后继承。macOS 系统服务虽按目标用户身份运行，其 launchd 域仍可能限制 GUI 环境更新；这类失败会记录日志，shell 环境文件仍可使用。Linux 用户管理器尚未启动等情况也会记录日志，并在后续健康检查中重试会话环境发布。
 
@@ -237,7 +243,7 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 
 安装目录由所选 `user_home` 决定，不随 `--config` 的位置改变。安装不会自动将目录加入 `PATH`，后续可使用安装副本的完整路径执行命令。从安装副本本身执行 `service install` 时会跳过自复制，更新配置及启动注册；安装副本可以通过 `update` 获取新版本。
 
-`service install` 会注册并立即启动；重复安装会更新注册并重新启动。启动注册直接指向所选配置文件。安装会将必要的用户身份、Codex 目录、命令行覆盖值及解析后的 Codex 执行文件路径保存到同一份配置中，保留注释及无关设置。已配置的路径会转为绝对路径以供服务使用；未指定的 `socket_path` 和 `state_dir` 继续按默认规则派生，不会固化为显式值。端口、daemon 选项等普通配置修改后，执行 `service restart` 即可生效，无需重新安装。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
+`service install` 会注册并立即启动；重复安装会更新注册并重新启动。启动注册直接指向所选配置文件。安装会将必要的用户身份、Codex 目录、命令行覆盖值及解析后的 Codex 执行文件路径保存到同一份配置中，保留注释及无关设置。proxy 模式无论是否开启 daemon 自动启动，都会解析并保存 `codex_path`，以便在服务的最小环境中启动 Codex。已配置的路径会转为绝对路径以供服务使用；未指定的 `socket_path` 和 `state_dir` 继续按默认规则派生，不会固化为显式值。端口、daemon 选项等普通配置修改后，执行 `service restart` 即可生效，无需重新安装。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
 
 Linux 生成的 systemd unit 停止时仅终止桥接进程，因此停止或重启桥接服务会保留独立运行的 Codex daemon。
 
@@ -312,7 +318,7 @@ sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /h
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
 ```
 
-服务文件为 `/etc/systemd/system/codex-app-server-bridge.service`。服务进程以 `alice` 的身份运行，需要能够访问二进制、所选配置文件和 Codex socket。安装会将专用安装目录、状态目录、程序副本及所选配置文件归属目标用户，程序副本权限为 `0755`；用户主目录内为此新建的父目录也归目标用户所有。已有父目录的所有者和权限保持不变，不递归更改用户主目录或 Codex 目录权限。用户主目录必须事先存在。
+服务文件为 `/etc/systemd/system/codex-app-server-bridge.service`。服务进程以 `alice` 的身份运行，需要能够访问二进制、所选配置文件和 Codex 主目录。proxy 模式通过 STDIO 启动 Codex，不需要固定的 socket 路径。安装会将专用安装目录、状态目录、程序副本及所选配置文件归属目标用户，程序副本权限为 `0755`；用户主目录内为此新建的父目录也归目标用户所有。已有父目录的所有者和权限保持不变，不递归更改用户主目录或 Codex 目录权限。用户主目录必须事先存在。
 
 ### macOS：登录启动 LaunchAgent
 
@@ -343,7 +349,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
-配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 按指定用户身份运行。用户目录或 Codex socket 在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
+配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 按指定用户身份运行。用户目录或 Codex 主目录在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
 
 ### 卸载与日志
 
@@ -357,14 +363,14 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 | Linux 系统服务 | `sudo journalctl -u codex-app-server-bridge -f` |
 | macOS launchd | `<state_dir>/service.stdout.log` 和 `service.stderr.log` |
 
-`status` 检查实例锁并输出运行状态；`service status` 查询操作系统启动项或服务状态。服务处于运行状态并不意味着 Codex socket 已经就绪，仍需查看 `status` 的 `ready` 字段。
+`status` 检查实例锁并输出运行状态（包括传输方式）；`service status` 查询操作系统启动项或服务状态。服务处于运行状态并不意味着 Codex 上游已经就绪，仍需查看 `status` 的 `ready` 字段。
 
 ## 协议与访问范围
 
-实现依据 OpenAI Codex 官方 `rust-v0.162.1` 源码：[`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) 在 UDS 上执行 WebSocket 握手，跨平台 UDS 实现在 [`codex-rs/uds/src/lib.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/uds/src/lib.rs)。本桥接因此采用 **WebSocket over TCP ↔ WebSocket over UDS**，不按逐行 JSON 文本解析 socket。
+默认实现依据 Codex 的 `app-server proxy`：[`stdio-to-uds`](https://github.com/openai/codex/tree/rust-v0.162.1/codex-rs/stdio-to-uds) 在 proxy STDIO 与 Codex 控制端点之间转发原始字节，[`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) 负责 daemon 侧 WebSocket 协议。因此默认采用 **WebSocket over TCP ↔ WebSocket over proxy STDIO**，不依赖 socket 文件名。设置 `transport = "socket"` 时，使用兼容路径 **WebSocket over TCP ↔ WebSocket over UDS**。两种模式都不会将上游解析为逐行 JSON 文本。
 
-每个客户端连接对应一个独立的上游连接，转发文本和二进制消息。socket 被关闭或替换时，已有会话可能断开；桥接会重新检测可用性，但客户端仍须自己重连并重新建立所需的 Codex 会话，不会自动重放请求。
+每个客户端连接对应一个独立的上游连接；proxy 模式会为该连接启动并回收一个 `codex app-server proxy` 子进程，转发文本和二进制消息。上游进程或端点关闭时，已有会话可能断开；桥接会重新检测可用性，但客户端仍须自己重连并重新建立所需的 Codex 会话，不会自动重放请求。
 
 只监听 loopback 地址，只接受根路径 `/`，拒绝查询参数和带 `Origin` 的握手；`Host` 必须与发布的 URL 一致。不会转发 `/daemon/shutdown` 等其他路径。浏览器页面连接会被拒绝，应使用原生 WebSocket 客户端。
 
-桥接没有额外的令牌认证。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对上述 Codex 控制 socket 协议，其他版本若更改握手或协议，需要重新验证。
+桥接没有额外的令牌认证。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对 Codex app-server 通过 proxy 或直连端点暴露的 WebSocket 协议，其他版本若更改握手或协议，需要重新验证。

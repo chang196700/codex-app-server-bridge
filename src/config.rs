@@ -11,6 +11,9 @@ use std::{
 pub const EXAMPLE: &str = r#"# ~/.codex-app-server-bridge/config.toml
 # Defaults to $CODEX_HOME, otherwise ~/.codex.
 # codex_home = "~/.codex"
+# Connect through `codex app-server proxy` over STDIO. Set transport = "socket"
+# only when direct control-socket compatibility is required.
+transport = "proxy"
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 # Opt in to starting the Codex app-server daemon when it is not running.
 auto_start_codex_app_server_daemon = false
@@ -36,6 +39,7 @@ publish_codex_app_server_ws_url_environment = false
 pub struct Config {
     pub codex_home: Option<PathBuf>,
     pub codex_path: Option<PathBuf>,
+    pub transport: Transport,
     pub auto_start_codex_app_server_daemon: bool,
     pub socket_path: Option<PathBuf>,
     pub user_home: Option<PathBuf>,
@@ -50,11 +54,25 @@ pub struct Config {
     pub publish_codex_app_server_ws_url_environment: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    Proxy,
+    Socket,
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self::Proxy
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             codex_home: None,
             codex_path: None,
+            transport: Transport::default(),
             auto_start_codex_app_server_daemon: false,
             socket_path: None,
             user_home: None,
@@ -84,7 +102,7 @@ pub struct Settings {
     pub config: Config,
     pub user_home: PathBuf,
     pub codex_home: PathBuf,
-    pub socket_path: PathBuf,
+    pub socket_path: Option<PathBuf>,
     pub state_dir: PathBuf,
 }
 
@@ -141,20 +159,25 @@ impl Settings {
             }
             config.codex_path = Some(absolute(path, &user_home)?);
         }
-        let socket_path = absolute(
-            config
-                .socket_path
-                .as_deref()
-                .unwrap_or(&codex_home.join("app-server-control/app-server-control.sock")),
-            &user_home,
-        )?;
-        if config.auto_start_codex_app_server_daemon
-            && socket_path != codex_home.join("app-server-control/app-server-control.sock")
-        {
-            bail!(
-                "automatic daemon startup requires the default control socket under codex_home; remove the socket_path override"
-            );
-        }
+        let socket_path = if config.transport == Transport::Socket {
+            let path = absolute(
+                config
+                    .socket_path
+                    .as_deref()
+                    .unwrap_or(&codex_home.join("app-server-control/app-server-control.sock")),
+                &user_home,
+            )?;
+            if config.auto_start_codex_app_server_daemon
+                && path != codex_home.join("app-server-control/app-server-control.sock")
+            {
+                bail!(
+                    "automatic daemon startup in socket transport requires the default control socket under codex_home; remove the socket_path override"
+                );
+            }
+            Some(path)
+        } else {
+            None
+        };
         let state_dir = absolute(
             config
                 .state_dir
@@ -187,7 +210,7 @@ impl Settings {
         }
         config.user_home = Some(user_home.clone());
         config.codex_home = Some(codex_home.clone());
-        config.socket_path = Some(socket_path.clone());
+        config.socket_path = socket_path.clone();
         config.state_dir = Some(state_dir.clone());
         Ok(Self {
             config,

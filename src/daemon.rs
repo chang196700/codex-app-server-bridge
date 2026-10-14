@@ -38,14 +38,18 @@ impl State {
                     cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
                         matches!(
                             error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
                         )
                     })
                 }) =>
             {
                 Self::Absent
             }
-            // An inaccessible socket, an unresponsive server, and a protocol
+            // An inaccessible endpoint, an unresponsive server, and a protocol
             // mismatch are not proof that the daemon has stopped.
             Err(_) => Self::Unavailable,
         }
@@ -82,7 +86,7 @@ pub async fn run(settings: Arc<Settings>, mut health: watch::Receiver<State>) {
         }
         match start(&settings).await {
             Ok(()) => {
-                tracing::info!("Codex daemon start completed; checking control socket readiness")
+                tracing::info!("Codex daemon start completed; checking app-server readiness")
             }
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), retry_seconds = retry_delay.as_secs(), "could not start Codex daemon; will retry")
@@ -128,7 +132,7 @@ async fn start(settings: &Settings) -> Result<()> {
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    tracing::info!(codex = %executable.display(), codex_home = %settings.codex_home.display(), "control socket absent; starting Codex app-server daemon");
+    tracing::info!(codex = %executable.display(), codex_home = %settings.codex_home.display(), "Codex app-server unavailable; starting daemon");
     let mut child = command
         .spawn()
         .with_context(|| format!("launch {} app-server daemon start", executable.display()))?;

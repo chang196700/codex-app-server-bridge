@@ -2,9 +2,9 @@
 
 English | [简体中文](README_ZH.md)
 
-A Rust program that monitors `$CODEX_HOME/app-server-control/app-server-control.sock` and exposes the local Codex control connection at `ws://127.0.0.1:<port>/`. It can optionally set the user environment variable `CODEX_APP_SERVER_WS_URL`; this is disabled by default.
+A Rust program that exposes Codex app-server at `ws://127.0.0.1:<port>/`. By default it starts one `codex app-server proxy` process per WebSocket client and carries the proxy's STDIO byte stream over WebSocket; it does not depend on Codex's control-socket path. An optional direct `socket` transport is available for compatibility. It can optionally set the user environment variable `CODEX_APP_SERVER_WS_URL`; this is disabled by default.
 
-Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. It can optionally start the Codex app-server daemon when it is not running; this is disabled by default. The bridge never creates, deletes, or replaces Codex's socket itself.
+Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. It can optionally start the Codex app-server daemon when it is not running; this is disabled by default. In the default proxy mode, Codex owns discovery and lifecycle of its control endpoint.
 
 ## Downloads and automatic releases
 
@@ -76,11 +76,11 @@ codex-app-server-bridge init-config
 # Run in the foreground; omitting the subcommand also runs the bridge
 codex-app-server-bridge run
 
-# Show the actual port, socket path, PID, and readiness
+# Show the actual port, transport, PID, and readiness
 codex-app-server-bridge status
 ```
 
-The socket does not need to exist at startup: the bridge stays running and periodically attempts to connect. Press `Ctrl+C` to stop a foreground instance.
+The proxy or socket endpoint does not need to be ready at startup: the bridge stays running and periodically attempts to connect. Press `Ctrl+C` to stop a foreground instance.
 
 ```sh
 # Fixed port; exits with an error if occupied, without switching ports
@@ -94,7 +94,7 @@ codex-app-server-bridge --codex-home /path/to/.codex run
 codex-app-server-bridge --config /path/to/bridge.toml run
 ```
 
-A dynamic port stays unchanged for the lifetime of the bridge process and may change after the bridge restarts. Restarting only Codex or recreating its socket does not change the port of a running bridge.
+A dynamic port stays unchanged for the lifetime of the bridge process and may change after the bridge restarts. Restarting only Codex or its proxy endpoint does not change the port of a running bridge.
 
 ## Configuration
 
@@ -106,7 +106,11 @@ If `~/.codex-app-server-bridge` is still a legacy TOML file, selecting the defau
 # Optional; defaults to CODEX_HOME, or ~/.codex if unset
 # codex_home = "~/.codex"
 
-# Usually unnecessary; defaults to the control socket path under codex_home
+# The default uses `codex app-server proxy` over STDIO, so the bridge does not
+# depend on Codex's control-socket path. Set `transport = "socket"` only for direct access.
+transport = "proxy"
+
+# Used only when transport = "socket"; defaults to this path under codex_home
 # socket_path = "~/.codex/app-server-control/app-server-control.sock"
 
 auto_start_codex_app_server_daemon = false  # Start an unavailable daemon; disabled by default
@@ -115,7 +119,7 @@ auto_start_codex_app_server_daemon = false  # Start an unavailable daemon; disab
 
 host = "127.0.0.1"             # ::1 is also supported; only loopback addresses are accepted
 port = 0                       # 0 selects a dynamic port; e.g. 8765 selects a fixed port
-poll_interval_ms = 2000         # Socket health check interval; at least 100 ms
+poll_interval_ms = 2000         # Upstream health check interval; at least 100 ms
 connect_timeout_ms = 3000       # Connection and handshake timeout; at least 100 ms
 max_connections = 64
 max_message_size = 67108864     # Bridge message/frame limit; Codex upstream limits still apply
@@ -132,7 +136,8 @@ Configuration precedence:
 | Configuration file | `--config`; otherwise `.codex-app-server-bridge/config.toml` under `--user-home`, or the current OS user's home directory when omitted |
 | User home directory | `--user-home` → TOML `user_home` → the current OS user's home directory |
 | Codex directory | `--codex-home` → TOML `codex_home` → the `CODEX_HOME` environment variable → `.codex` in the selected user's home directory |
-| Socket path | TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
+| Upstream transport | TOML `transport` → `proxy` (Codex `app-server proxy` over STDIO) |
+| Socket path | Used only when `transport = "socket"`; TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex executable | TOML `codex_path` → automatic detection on `PATH` and in common installation locations |
 | Port | `--port` → TOML `port` → `0` |
 
@@ -145,6 +150,7 @@ codex-app-server-bridge config list
 codex-app-server-bridge config get port
 codex-app-server-bridge config set port 8765
 codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
 codex-app-server-bridge config get codex_path
@@ -162,7 +168,7 @@ codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
 
 `config set KEY VALUE` accepts a value matching the field's type. Numbers and booleans use TOML syntax; string fields, including paths and `host`, also accept plain strings as shown above. There is no special unset or `null` syntax for removing a field. The command creates a missing configuration file, including one selected with `--config`, preserves other fields and comments, validates the complete configuration before writing, and prints the saved value as JSON. It does not write runtime overrides into the file.
 
-Configuration keys support dot-separated path navigation. The current schema has only top-level fields, so use names such as `port` and `socket_path`; there are no nested settings to address yet. Unknown fields or subkeys are rejected.
+Configuration keys support dot-separated path navigation. The current schema has only top-level fields, so use names such as `port`, `transport`, and `socket_path`; there are no nested settings to address yet. Unknown fields or subkeys are rejected.
 
 The service reads the same configuration file that `config list`, `config get`, and `config set` select: the default `~/.codex-app-server-bridge/config.toml`, or the file supplied with `--config` at installation. Configuration changes do not reload a running instance. Restart a foreground process, or use `service restart` for an installed service; an operating-system service restart or reboot also applies the changes. Starting a stopped service reads the file again.
 
@@ -181,13 +187,13 @@ Changes to `user_home` or `state_dir` affect installation or runtime locations. 
 
 Set `auto_start_codex_app_server_daemon = true` to let the bridge start an unavailable Codex app-server daemon. The option defaults to `false`. When enabled, the bridge creates a missing `CODEX_HOME` directory as needed before starting the daemon; it does not create that directory when the option is disabled. Install a Codex CLI version that supports `codex app-server daemon start`; the command has been checked with Codex CLI 0.162.1. Use the executable from a complete Codex CLI installation: copying only a standalone executable may leave it unable to prepare the daemon package.
 
-The bridge uses its existing socket health check. A healthy daemon is left running. If connecting to the socket returns `NotFound` or `ConnectionRefused`, a background worker runs the idempotent `codex app-server daemon start` command with the selected `CODEX_HOME`. Permission errors, failed WebSocket handshakes, and timeouts do not trigger a start. Startup attempts do not block the WebSocket listener; failures are logged and retried with an exponential delay from 5 to 60 seconds. Stopping the bridge does not stop the independent Codex daemon.
+The bridge runs its configured upstream health check. A healthy daemon is left running. If the proxy exits because the daemon is unavailable, or a direct socket connection returns `NotFound` or `ConnectionRefused`, a background worker runs the idempotent `codex app-server daemon start` command with the selected `CODEX_HOME`. Permission errors, protocol mismatches, and timeouts do not trigger a start. Startup attempts do not block the WebSocket listener; failures are logged and retried with an exponential delay from 5 to 60 seconds. Stopping the bridge does not stop the independent Codex daemon.
 
 Omit `codex_path` to search `PATH` and common installation locations, or set it to the Codex executable's path. Absolute paths, a leading `~`, and relative paths follow the configuration path rules above. When automatic daemon startup is enabled, `service install` resolves the executable and saves its absolute path in the selected configuration file, preserving comments and other settings. After changing the option, `codex_path`, or `codex_home`, restart the bridge service to apply the change. If Codex moves, update `codex_path` before restarting.
 
 On Unix, an npm-installed launcher also needs Node on the service's `PATH`. The bridge adds the selected Codex executable's directory to the startup command's `PATH`, supporting installations such as nvm that keep `node` alongside `codex`. If Node is unavailable there or on the service's existing `PATH`, set `codex_path` to the native executable within the complete Codex package.
 
-Automatic startup requires the standard `<codex_home>/app-server-control/app-server-control.sock` socket. You can select another Codex data directory with `codex_home` or `--codex-home`, but cannot combine automatic startup with a different `socket_path`.
+With the default `transport = "proxy"`, automatic startup does not require the bridge to know the daemon's socket path; Codex resolves that endpoint. `transport = "socket"` retains direct control-socket compatibility and requires the standard `<codex_home>/app-server-control/app-server-control.sock` when automatic startup is enabled.
 
 On Windows, automatic daemon startup requires an ordinary, non-elevated user process; use foreground mode or `service install --scope user` from a normal PowerShell session. Codex rejects daemon startup from elevated processes and LocalSystem. Installing a Windows `--scope system` service with automatic startup enabled is therefore rejected. A Windows system service can still bridge a daemon that is already running when this option is disabled. Linux and macOS system services run as the specified `--username` and can use automatic daemon startup.
 
@@ -205,7 +211,7 @@ publish_codex_app_server_ws_url_environment = true
 
 After changing it, restart the foreground process or run `service restart` for an installed service. To disable an enabled publisher, first stop the old process so it can remove the variable it published, then set the option to `false` and start the bridge or service.
 
-The following behavior applies only when publication is enabled. The bridge publishes the URL after connecting to the socket and completing a WebSocket health check. If the socket becomes unavailable, it withdraws the variable it published and republishes it when the socket recovers. It also cleans up on normal exit. Cleanup checks the existing value and preserves a different value subsequently written by the user or another program.
+The following behavior applies only when publication is enabled. The bridge publishes the URL after connecting to the configured upstream and completing a WebSocket health check. If the upstream becomes unavailable, it withdraws the variable it published and republishes it when the upstream recovers. It also cleans up on normal exit. Cleanup checks the existing value and preserves a different value subsequently written by the user or another program.
 
 | Platform | Publication method |
 | --- | --- |
@@ -227,7 +233,7 @@ An existing Windows PowerShell session can reread the value from the user regist
 $env:CODEX_APP_SERVER_WS_URL = [Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'User')
 ```
 
-**An external process cannot directly change the environment of an existing terminal or application.** Clients that are already running must reload their environment or restart. An inherited variable also remains in an existing process after the socket goes offline. On Unix, `environment.sh` exists only while the URL is published. Do not treat a stale shell variable as current status when the socket is offline; use `status` to check.
+**An external process cannot directly change the environment of an existing terminal or application.** Clients that are already running must reload their environment or restart. An inherited variable also remains in an existing process after the upstream goes offline. On Unix, `environment.sh` exists only while the URL is published. Do not treat a stale shell variable as current status when the upstream is offline; use `status` to check.
 
 Native Windows services run in Session 0, so their environment change broadcasts cannot refresh Explorer in another session. The registry is still updated; the current session must explicitly read the variable, or inherit it after signing in again. Although a macOS system service runs as the target user, its launchd domain may still restrict GUI environment updates. Such failures are logged, and the shell environment file remains available. Conditions such as a Linux user manager that has not yet started are also logged, and session environment publication is retried during subsequent health checks.
 
@@ -237,7 +243,7 @@ Native Windows services run in Session 0, so their environment change broadcasts
 
 The installation directory follows the selected `user_home`, regardless of where `--config` points. Installation does not add the directory to `PATH`; use the installed executable's full path for later commands if needed. Running `service install` from the installed copy skips copying the executable onto itself and updates the configuration and startup registration. The installed copy can fetch a newer version with `update`.
 
-`service install` registers and immediately starts the service or startup entry. Running it again updates the registration and restarts the instance. The registration points directly to the selected configuration file. Installation saves the necessary user identity, Codex directory, command-line overrides, and resolved Codex executable path to that same file while preserving comments and unrelated settings. Configured paths are made absolute for service use; omitted `socket_path` and `state_dir` remain derived defaults instead of being frozen into explicit values. Changes to ordinary settings such as the port or daemon options take effect after `service restart`, without reinstalling. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
+`service install` registers and immediately starts the service or startup entry. Running it again updates the registration and restarts the instance. The registration points directly to the selected configuration file. Installation saves the necessary user identity, Codex directory, command-line overrides, and resolved Codex executable path to that same file while preserving comments and unrelated settings. Configured paths are made absolute for service use; omitted `socket_path` and `state_dir` remain derived defaults instead of being frozen into explicit values. Proxy services always resolve and save the selected `codex_path` so they can start under a minimal service environment. Changes to ordinary settings such as the port or daemon options take effect after `service restart`, without reinstalling. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
 
 On Linux, the generated systemd unit stops only the bridge process, preserving the independent Codex daemon across bridge stops and restarts.
 
@@ -312,7 +318,7 @@ sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /h
 sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /home/alice --codex-home /home/alice/.codex service uninstall --scope system --username alice
 ```
 
-The service file is `/etc/systemd/system/codex-app-server-bridge.service`. The process runs as `alice` and must be able to access the executable, selected configuration file, and Codex socket. Installation assigns the dedicated installation and state directories, installed executable, and selected configuration file to the target user; the executable has mode `0755`. Any parent directories created for this purpose within the user's home also belong to the target user. Existing parent directories retain their ownership and permissions. Installation does not recursively change permissions in the user home or Codex directory. The user's home directory must already exist.
+The service file is `/etc/systemd/system/codex-app-server-bridge.service`. The process runs as `alice` and must be able to access the executable, selected configuration file, and Codex home. In proxy mode, the service starts Codex through its STDIO proxy and does not need a hard-coded socket path. Installation assigns the dedicated installation and state directories, installed executable, and selected configuration file to the target user; the executable has mode `0755`. Any parent directories created for this purpose within the user's home also belong to the target user. Existing parent directories retain their ownership and permissions. Installation does not recursively change permissions in the user home or Codex directory. The user's home directory must already exist.
 
 ### macOS: LaunchAgent at login
 
@@ -343,7 +349,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
-The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`. Its `UserName` setting runs the process as the specified user. If the user directory or Codex socket is unavailable before login, the bridge still depends on those resources becoming available. A LaunchDaemon cannot unlock encrypted user data in advance.
+The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`. Its `UserName` setting runs the process as the specified user. If the user directory or Codex home is unavailable before login, the bridge still depends on those resources becoming available. A LaunchDaemon cannot unlock encrypted user data in advance.
 
 ### Uninstall and logs
 
@@ -357,14 +363,14 @@ The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.pli
 | Linux system service | `sudo journalctl -u codex-app-server-bridge -f` |
 | macOS launchd | `<state_dir>/service.stdout.log` and `service.stderr.log` |
 
-`status` checks the instance lock and reports runtime state. `service status` queries the OS startup entry or service status. A running service does not necessarily mean the Codex socket is ready; check the `ready` field from `status`.
+`status` checks the instance lock and reports runtime state, including the selected transport. `service status` queries the OS startup entry or service status. A running service does not necessarily mean the Codex upstream is ready; check the `ready` field from `status`.
 
 ## Protocol and access
 
-The implementation follows the official OpenAI Codex `rust-v0.162.1` source: [`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) performs a WebSocket handshake over UDS, and [`codex-rs/uds/src/lib.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/uds/src/lib.rs) provides the cross-platform UDS implementation. This bridge therefore uses **WebSocket over TCP ↔ WebSocket over UDS**. It does not parse the socket as line-delimited JSON.
+The default implementation follows Codex's `app-server proxy`: [`stdio-to-uds`](https://github.com/openai/codex/tree/rust-v0.162.1/codex-rs/stdio-to-uds) forwards raw bytes between proxy STDIO and Codex's control endpoint, while [`unix_socket.rs`](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-transport/src/transport/unix_socket.rs) handles the daemon-side WebSocket protocol. This bridge therefore uses **WebSocket over TCP ↔ WebSocket over proxy STDIO** by default and does not depend on a socket filename. With `transport = "socket"`, it uses the compatibility path **WebSocket over TCP ↔ WebSocket over UDS**. Neither mode parses the upstream as line-delimited JSON.
 
-Each client connection has its own upstream connection, forwarding text and binary messages. Existing sessions may disconnect when the socket is closed or replaced. The bridge detects when it becomes available again, but clients must reconnect and reestablish any required Codex session themselves. Requests are not automatically replayed.
+Each client connection has its own upstream connection; proxy mode starts and reaps one `codex app-server proxy` process for that client. Existing sessions may disconnect when the upstream process or endpoint closes. The bridge detects when it becomes available again, but clients must reconnect and reestablish any required Codex session themselves. Requests are not automatically replayed.
 
 The bridge listens only on loopback addresses and accepts only the root path `/`. It rejects query parameters and handshakes containing `Origin`; `Host` must match the published URL. Other paths, such as `/daemon/shutdown`, are not forwarded. Connections from browser pages are rejected; use a native WebSocket client.
 
-The bridge does not add token authentication. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex control socket protocol described above. Other versions require revalidation if they change the handshake or protocol.
+The bridge does not add token authentication. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex app-server WebSocket protocol exposed by proxy or the direct control endpoint. Other versions require revalidation if they change the handshake or protocol.

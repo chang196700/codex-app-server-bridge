@@ -21,7 +21,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Monitor Codex's control socket and expose a local WebSocket endpoint"
+    about = "Expose Codex app-server over a local WebSocket endpoint"
 )]
 struct Cli {
     /// TOML config file (default: ~/.codex-app-server-bridge/config.toml)
@@ -249,8 +249,12 @@ fn main() -> Result<()> {
                 );
             }
             if matches!(action, service::Action::Install) {
-                let detected_codex_path = if settings.config.auto_start_codex_app_server_daemon {
-                    daemon::check_launch_context()?;
+                let detected_codex_path = if settings.config.transport == config::Transport::Proxy
+                    || settings.config.auto_start_codex_app_server_daemon
+                {
+                    if settings.config.auto_start_codex_app_server_daemon {
+                        daemon::check_launch_context()?;
+                    }
                     Some(codex_path::resolve(
                         settings.config.codex_path.as_deref(),
                         &settings.user_home,

@@ -71,7 +71,8 @@ pub fn prepare_service(
     // value read earlier while a concurrent `config set` could still change it.
     let mut document = read_document(path, true)?;
     let configured = parse_config(&document, path)?;
-    let explicit_socket = configured.socket_path.is_some();
+    let explicit_socket = configured.transport == config::Transport::Socket
+        && configured.socket_path.is_some();
     let explicit_state = configured.state_dir.is_some();
     let settings = Settings::from_config(configured, user_home, codex_home, port, true)?;
     let table = document.as_table_mut();
@@ -80,8 +81,10 @@ pub fn prepare_service(
     // selected homes, but let defaults derived from them follow future edits.
     set_path(table, "user_home", &settings.user_home)?;
     set_path(table, "codex_home", &settings.codex_home)?;
-    if explicit_socket {
-        set_path(table, "socket_path", &settings.socket_path)?;
+    if explicit_socket
+        && let Some(socket_path) = settings.socket_path.as_deref()
+    {
+        set_path(table, "socket_path", socket_path)?;
     }
     if explicit_state {
         set_path(table, "state_dir", &settings.state_dir)?;
@@ -91,9 +94,7 @@ pub fn prepare_service(
     }
     if let Some(path) = settings.config.codex_path.as_deref() {
         set_path(table, "codex_path", path)?;
-    } else if settings.config.auto_start_codex_app_server_daemon
-        && let Some(path) = detected_codex_path
-    {
+    } else if let Some(path) = detected_codex_path {
         if path.as_os_str().is_empty() {
             bail!("detected Codex executable path must not be empty");
         }

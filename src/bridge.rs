@@ -1,5 +1,6 @@
 use crate::{
-    config::{Settings, private_dir},
+    config::{Settings, Transport, private_dir},
+    codex_path,
     environment::Publisher,
     socket,
 };
@@ -9,6 +10,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use std::{
     fs::OpenOptions,
+    io,
     net::SocketAddr,
     sync::{
         Arc,
@@ -17,7 +19,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Semaphore, watch},
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
@@ -37,7 +41,9 @@ struct Status<'a> {
     pid: u32,
     ready: bool,
     url: &'a str,
-    socket_path: &'a std::path::Path,
+    transport: Transport,
+    codex_path: Option<&'a std::path::Path>,
+    socket_path: Option<&'a std::path::Path>,
     updated_at_unix: u64,
 }
 
@@ -46,7 +52,9 @@ fn write_status(settings: &Settings, url: &str, ready: bool) -> Result<()> {
         pid: std::process::id(),
         ready,
         url,
-        socket_path: &settings.socket_path,
+        transport: settings.config.transport,
+        codex_path: settings.config.codex_path.as_deref(),
+        socket_path: settings.socket_path.as_deref(),
         updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
     crate::write_atomic(
@@ -61,15 +69,160 @@ fn ws_config(settings: &Settings) -> WebSocketConfig {
         .max_frame_size(Some(settings.config.max_message_size))
 }
 
-async fn upstream(settings: &Settings) -> Result<WebSocketStream<socket::Stream>> {
+/// A bidirectional async stream backed by one Codex `app-server proxy`
+/// process. The proxy speaks WebSocket frames on stdin/stdout and resolves
+/// the daemon endpoint itself, so the bridge does not depend on a socket path.
+struct ProxyStream {
+    reader: ChildStdout,
+    writer: ChildStdin,
+    child: Option<Child>,
+}
+
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> IoStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type UpstreamStream = Box<dyn IoStream>;
+
+impl ProxyStream {
+    fn new(reader: ChildStdout, writer: ChildStdin, child: Child) -> Self {
+        Self {
+            reader,
+            writer,
+            child: Some(child),
+        }
+    }
+}
+
+impl AsyncRead for ProxyStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        match std::pin::Pin::new(&mut self.reader).poll_read(cx, buf) {
+            // A proxy that exits before completing the handshake has no
+            // WebSocket close frame to report. Surface this as an explicit
+            // unexpected EOF so daemon supervision can classify it as absent.
+            std::task::Poll::Ready(Ok(())) if buf.filled().len() == filled => {
+                std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Codex app-server proxy closed stdout",
+                )))
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for ProxyStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
+impl Drop for ProxyStream {
+    fn drop(&mut self) {
+        // Tokio's start_kill is deliberately non-waiting and can leave a Unix
+        // zombie. Move the handle into a short reaper task so every proxy is
+        // both terminated and waited for when a downstream disconnects.
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+async fn proxy_stream(settings: &Settings) -> Result<ProxyStream> {
+    let executable = codex_path::resolve(
+        settings.config.codex_path.as_deref(),
+        &settings.user_home,
+    )?;
+    let mut command = Command::new(&executable);
+    // npm and version-manager launchers commonly require their containing
+    // directory to remain in PATH. Services otherwise provide a minimal PATH.
+    if let Some(directory) = executable.parent() {
+        let mut paths = vec![directory.to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        command.env(
+            "PATH",
+            std::env::join_paths(paths).context("prepare Codex proxy PATH")?,
+        );
+    }
+    command
+        .args(["app-server", "proxy"])
+        .env("CODEX_HOME", &settings.codex_home)
+        .env("HOME", &settings.user_home)
+        // The bridge owns publication of this value. Do not let a proxy
+        // inherit it and accidentally connect back through this listener.
+        .env_remove("CODEX_APP_SERVER_WS_URL")
+        .current_dir(&settings.user_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Keep proxy diagnostics in the bridge's stderr (service managers
+        // route it to the bridge log) instead of allowing a stderr pipe to
+        // fill and stall the proxy.
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("launch {} app-server proxy", executable.display()))?;
+    let writer = child
+        .stdin
+        .take()
+        .context("Codex proxy did not provide stdin")?;
+    let reader = child
+        .stdout
+        .take()
+        .context("Codex proxy did not provide stdout")?;
+    Ok(ProxyStream::new(reader, writer, child))
+}
+
+async fn upstream(settings: &Settings) -> Result<WebSocketStream<UpstreamStream>> {
     timeout(settings.timeout(), async {
-        let stream = socket::connect(&settings.socket_path).await?;
+        let stream: UpstreamStream = match settings.config.transport {
+            Transport::Proxy => Box::new(proxy_stream(settings).await?),
+            Transport::Socket => {
+                let socket_path = settings
+                    .socket_path
+                    .as_deref()
+                    .context("socket transport has no resolved socket_path")?;
+                Box::new(socket::connect(socket_path).await?)
+            }
+        };
         let (websocket, _) =
             client_async_with_config("ws://localhost/", stream, Some(ws_config(settings))).await?;
         Ok::<_, anyhow::Error>(websocket)
     })
     .await
-    .context("control socket connection/handshake timed out")?
+    .context("Codex upstream connection/handshake timed out")?
 }
 
 fn reject(status: StatusCode, reason: &str) -> ErrorResponse {
@@ -97,7 +250,7 @@ async fn connection(
                 if !ready.load(Ordering::Acquire) {
                     return Err(reject(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "socket unavailable",
+                        "Codex upstream unavailable",
                     ));
                 }
                 if request.uri().path() != "/" || request.uri().query().is_some() {
@@ -166,11 +319,6 @@ where
 }
 
 async fn probe(settings: &Settings) -> Result<()> {
-    // Winsock can report WSAENETDOWN for a nonexistent AF_UNIX path. A
-    // filesystem check preserves NotFound without guessing from that code,
-    // while access-denied errors remain distinct from a stopped daemon.
-    #[cfg(windows)]
-    tokio::fs::metadata(&settings.socket_path).await?;
     let mut ws = upstream(settings).await?;
     timeout(settings.timeout(), async {
         ws.close(None).await?;
@@ -179,7 +327,7 @@ async fn probe(settings: &Settings) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("control socket close handshake timed out")??;
+    .context("Codex upstream close handshake timed out")??;
     Ok(())
 }
 
@@ -278,14 +426,23 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
             let health = probe(&health_settings).await;
             daemon_tx.send_replace(crate::daemon::State::from_probe(&health));
             if let Err(error) = &health {
-                tracing::debug!(%error, "control socket probe failed");
+                tracing::debug!(%error, "Codex upstream probe failed");
             }
             if health_tx.send(health.is_ok()).is_err() {
                 break;
             }
         }
     });
-    tracing::info!(%url, socket = %settings.socket_path.display(), "listening; waiting for the Codex control socket");
+    let transport_name = match settings.config.transport {
+        Transport::Proxy => "proxy",
+        Transport::Socket => "socket",
+    };
+    tracing::info!(
+        %url,
+        transport = transport_name,
+        codex = ?settings.config.codex_path,
+        "listening; waiting for Codex upstream"
+    );
     let result: Result<()> = async {
         loop {
             if *shutdown.borrow() { break; }
@@ -299,12 +456,12 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
                     }
                 },
                 changed = health_rx.changed() => {
-                    changed.context("control socket monitor stopped unexpectedly")?;
+                    changed.context("Codex upstream monitor stopped unexpectedly")?;
                     let is_ready = *health_rx.borrow_and_update();
                     let was_ready = ready.swap(is_ready, Ordering::AcqRel);
-                    if is_ready && !was_ready { tracing::info!(%url, "control socket ready"); }
+                    if is_ready && !was_ready { tracing::info!(%url, "Codex upstream ready"); }
                     if !is_ready && was_ready {
-                        tracing::warn!("control socket unavailable; waiting for recovery");
+                        tracing::warn!("Codex upstream unavailable; waiting for recovery");
                         tasks.abort_all();
                     }
                     environment_tx.send_replace(is_ready);
