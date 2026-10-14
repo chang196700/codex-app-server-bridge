@@ -1,6 +1,6 @@
 # codex-app-server-bridge
 
-使用 Rust 监控 `$CODEX_HOME/app-server-control/app-server-control.sock`，将 Codex 的本地控制连接转发为 `ws://127.0.0.1:<端口>/`，并在连接可用时发布用户环境变量 `CODEX_APP_SERVER_WS_URL`。
+使用 Rust 监控 `$CODEX_HOME/app-server-control/app-server-control.sock`，将 Codex 的本地控制连接转发为 `ws://127.0.0.1:<端口>/`。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
 
 支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。程序不会启动 Codex，也不会创建、删除或替换 Codex 的 socket。
 
@@ -58,7 +58,7 @@ poll_interval_ms = 2000         # socket 健康检查间隔，至少 100 毫秒
 connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
 max_connections = 64
 max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
-publish_environment = true
+publish_environment = false    # 自动设置用户环境变量，默认关闭；设为 true 开启
 
 # 必须使用本程序专用的状态目录
 # state_dir = "~/.local/state/codex-app-server-bridge"
@@ -78,7 +78,17 @@ publish_environment = true
 
 ## 环境变量如何生效
 
-桥接完成 socket 连接和 WebSocket 健康检查后才发布 URL。socket 失联时撤回自己发布的变量，恢复后重新发布；正常退出时也会清理。清理会核对原值，保留用户或其他程序后来写入的不同值。
+自动设置环境变量**默认关闭**，省略 `publish_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
+
+需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge` 中开启：
+
+```toml
+publish_environment = true
+```
+
+修改后重启前台进程；已安装服务则重新运行相同的 `service install` 命令，使配置快照更新并重启。要关闭已开启的发布功能，先停止原进程，让它清理自己发布的变量，再设为 `false` 并启动或重新安装服务。
+
+以下发布行为仅在开启时生效：桥接完成 socket 连接和 WebSocket 健康检查后才发布 URL。socket 失联时撤回自己发布的变量，恢复后重新发布；正常退出时也会清理。清理会核对原值，保留用户或其他程序后来写入的不同值。
 
 | 平台 | 发布方式 |
 | --- | --- |

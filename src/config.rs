@@ -19,7 +19,8 @@ poll_interval_ms = 2000
 connect_timeout_ms = 3000
 max_connections = 64
 max_message_size = 67108864
-publish_environment = true
+# Opt in to automatically setting CODEX_APP_SERVER_WS_URL for the user.
+publish_environment = false
 # Runtime state and shell environment exports live here.
 # state_dir = "~/.local/state/codex-app-server-bridge"
 "#;
@@ -55,7 +56,7 @@ impl Default for Config {
             connect_timeout_ms: 3000,
             max_connections: 64,
             max_message_size: 64 * 1024 * 1024,
-            publish_environment: true,
+            publish_environment: false,
         }
     }
 }
