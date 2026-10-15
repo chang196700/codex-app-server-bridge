@@ -19,9 +19,9 @@
 
 八种构建均使用对应架构的 GitHub 原生 runner。Linux GNU 使用 Ubuntu 24.04 构建，产物面向 glibc 2.39 及以上系统。musl 产物在相同 x86_64/ARM64 架构 runner 的 Alpine 容器中静态链接，不依赖 glibc，适用于 Alpine 或 glibc 较旧的发行版；构建时会检查产物没有动态加载器及共享库依赖。
 
-推送到 `main` 后，工作流自动运行 [release-plz](https://release-plz.dev/) 更新版本，并根据 Git commit message 生成 `CHANGELOG.md`，由 `github-actions[bot]` 提交这些变更。自动发布提交本身不计入变更日志。若版本尚未打标签便重跑准备步骤，会重新生成该版本章节，包含期间新增的提交；已有标签的版本章节保持不变。八个目标全部通过格式检查、Clippy、release 编译和程序版本检查后，工作流创建 `v<版本>` 标签，并发布包含完整压缩包和校验文件的 GitHub Release。无需手动合并发布 PR，也不发布到 crates.io。版本号按 release-plz 的提交分析规则更新，建议使用 `fix: ...`、`feat: ...`、`feat!: ...` 等 Conventional Commits 表达变更类型。
+推送到 `main` 后，工作流自动运行 [release-plz](https://release-plz.dev/) 更新版本，并根据 Git commit message 生成 `CHANGELOG.md`。准备阶段以 `github-actions[bot]` 身份创建本地版本提交，通过工作流产物把相同源码交给构建任务，不推送提交或标签。自动发布提交本身不计入变更日志。若版本尚未打标签便重跑准备步骤，会重新生成该版本章节，包含期间新增的提交；已有标签的版本章节保持不变。只有八个目标全部通过格式检查、Clippy、release 编译和程序版本检查，且压缩包校验通过后，工作流才推送已构建的版本提交、创建对应的 `v<版本>` 标签，并发布包含完整压缩包和校验文件的 GitHub Release。无需手动合并发布 PR，也不发布到 crates.io。版本号按 release-plz 的提交分析规则更新，建议使用 `fix: ...`、`feat: ...`、`feat!: ...` 等 Conventional Commits 表达变更类型。
 
-工作流使用内置 `GITHUB_TOKEN`，无需额外配置 Secrets。`main` 必须允许工作流提交版本变更；该 Token 创建的提交不会再次触发工作流。发布串行执行，排队的任务读取最新 `main`，因此短时间内的多次推送可能合并为一个 Release。发布中断时，可以重跑失败的任务，或在 `main` 上手动运行 **Release** 工作流。已有标签始终对应原始源码，完整发布的版本不会被覆盖。构建失败时，版本提交保留在 `main`，不会发布缺少产物的 Release。
+工作流使用内置 `GITHUB_TOKEN`，无需额外配置 Secrets。只有发布任务拥有仓库写权限，`main` 必须允许其提交版本变更；该 Token 创建的提交不会再次触发工作流。发布串行执行，排队的任务读取最新 `main`，因此短时间内的多次推送可能合并为一个 Release。若构建期间 `main` 有新提交，当前发布会停止，不覆盖远端或变基已构建的源码，由后续任务准备新源码。发布中断时，可以重跑失败的任务，或在 `main` 上手动运行 **Release** 工作流。已有标签始终对应原始源码，完整发布的版本不会被覆盖。构建失败不会向远端推送新的版本提交或标签，也不会发布 Release。
 
 ## 从 GitHub 更新
 

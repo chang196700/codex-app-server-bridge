@@ -177,13 +177,13 @@ pub fn save_service_config(options: &ServiceOptions) -> Result<()> {
     let text = toml::to_string_pretty(&ServiceConfig::from(options))?;
     crate::write_atomic(&path, text.as_bytes())?;
     #[cfg(unix)]
-    if options.scope == Scope::System {
-        if let Some(username) = options.username.as_deref() {
-            // A system install is commonly executed through sudo. Keep the
-            // metadata readable by the service account that owns the fixed
-            // executable and configuration directory.
-            checked(std::process::Command::new("chown").arg(username).arg(&path))?;
-        }
+    if options.scope == Scope::System
+        && let Some(username) = options.username.as_deref()
+    {
+        // A system install is commonly executed through sudo. Keep the
+        // metadata readable by the service account that owns the fixed
+        // executable and configuration directory.
+        checked(std::process::Command::new("chown").arg(username).arg(&path))?;
     }
     Ok(())
 }
@@ -838,7 +838,7 @@ fn system_username(options: &ServiceOptions) -> Result<&str> {
 /// Resolve the account running the installer.  LaunchDaemon and Windows
 /// registrations use this account by default so they do not silently fall
 /// back to root/LocalSystem.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub fn current_username() -> Result<String> {
     let output = checked(std::process::Command::new("id").arg("-un"))?;
     let username = String::from_utf8(output.stdout)?.trim().to_owned();

@@ -8,7 +8,11 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: Commit to build and package
+        description: Published source commit to check out
+        required: false
+        type: string
+      prepared_sha:
+        description: Local release commit to restore from the prepared-source artifact
         required: false
         type: string
 
@@ -48,6 +52,23 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Download unpublished release source
+        if: inputs.prepared_sha != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared-source
+      - name: Restore the prepared release commit
+        if: inputs.prepared_sha != ''
+        env:
+          PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
+          RELEASE_SHA: ${{ inputs.prepared_sha }}
+          RELEASE_BASE_SHA: ${{ inputs.ref }}
+        run: |
+          $python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $python .github/scripts/release.py restore
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot restore the prepared release source.' }
       - name: Build and package native executable
         if: ${{ !endsWith(matrix.target, '-musl') }}
         run: ./.github/scripts/build.ps1 -Target '${{ matrix.target }}'

@@ -8,8 +8,8 @@ on:
 permissions:
   contents: read
 
-# Serialize version updates and publication. New pushes wait for the active
-# release; a queued run checks out the newest main, including intervening pushes.
+# Serialize release candidates. A candidate remains local until every native
+# build succeeds; publication also rejects a candidate if main has moved on.
 concurrency:
   group: release-main
   cancel-in-progress: false
@@ -20,9 +20,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
       pull-requests: read
     outputs:
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
       sha: ${{ steps.prepare.outputs.sha }}
       tag: ${{ steps.prepare.outputs.tag }}
       version: ${{ steps.prepare.outputs.version }}
@@ -32,6 +33,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
       - name: Install release-plz
         run: bash .github/scripts/install-release-plz.sh
       - name: Update version and changelog
@@ -39,14 +41,23 @@ jobs:
         env:
           GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
         run: python3 .github/scripts/release.py prepare
+      - name: Save unpublished release source
+        if: steps.prepare.outputs.should_release == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared-source/
+          if-no-files-found: error
 
   build:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ needs.prepare.outputs.sha }}
+      ref: ${{ needs.prepare.outputs.base_sha }}
+      prepared_sha: ${{ needs.prepare.outputs.sha }}
 
   publish:
     needs: [prepare, build]
@@ -58,9 +69,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.base_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download unpublished release source
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared-source
+      - name: Restore the built release commit
+        env:
+          PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: python3 .github/scripts/release.py restore
       - name: Install release-plz
         run: bash .github/scripts/install-release-plz.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -74,5 +96,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
           RELEASE_ASSETS: ${{ runner.temp }}/release-assets
         run: python3 .github/scripts/release.py publish
