@@ -318,14 +318,23 @@ where
 
 async fn probe(settings: &Settings) -> Result<()> {
     let mut ws = upstream(settings).await?;
-    timeout(settings.timeout(), async {
+    // The successful opening handshake establishes readiness. Some Codex
+    // proxies leave stdout open after a close frame, so connection cleanup
+    // must not turn a reachable daemon into an unhealthy upstream.
+    let cleanup = timeout(settings.timeout(), async {
         ws.close(None).await?;
-        // Finish the close handshake rather than leaving resets in server logs.
+        // Allow a graceful close where supported, then drop/reap the proxy.
         let _ = ws.next().await;
         Ok::<_, anyhow::Error>(())
     })
-    .await
-    .context("Codex upstream close handshake timed out")??;
+    .await;
+    match cleanup {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "upstream probe cleanup failed after successful handshake")
+        }
+        Err(_) => tracing::debug!("upstream probe cleanup timed out after successful handshake"),
+    }
     Ok(())
 }
 
