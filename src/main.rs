@@ -33,7 +33,7 @@ struct Cli {
     /// Override CODEX_HOME and the TOML codex_home setting
     #[arg(long, global = true)]
     codex_home: Option<PathBuf>,
-    /// 0 selects an available port; any other value is a fixed port
+    /// Default WebSocket port only; 0 selects an available port
     #[arg(long, global = true)]
     port: Option<u16>,
     #[command(subcommand)]
@@ -57,8 +57,14 @@ enum Command {
     Service {
         #[arg(value_enum)]
         action: service::Action,
-        #[arg(long, value_enum, default_value = "user")]
-        scope: service::Scope,
+        #[arg(long, value_enum)]
+        scope: Option<service::Scope>,
+        /// Registration backend (defaults to the native backend for --scope).
+        #[arg(long = "type", value_enum)]
+        service_type: Option<service::ServiceType>,
+        /// Start at user login or operating-system startup.
+        #[arg(long, value_enum)]
+        autostart: Option<service::Autostart>,
         /// Required for Linux/macOS system services: run as this account
         #[arg(long)]
         username: Option<String>,
@@ -68,8 +74,8 @@ enum Command {
         /// Update this executable instead, without managing a service
         #[arg(long = "self", conflicts_with_all = ["scope", "username"])]
         update_self: bool,
-        #[arg(long, value_enum, default_value = "user")]
-        scope: service::Scope,
+        #[arg(long, value_enum)]
+        scope: Option<service::Scope>,
         /// Required for Linux/macOS system services: the installed service account
         #[arg(long)]
         username: Option<String>,
@@ -171,7 +177,8 @@ fn main() -> Result<()> {
         println!("{}", path.display());
         return Ok(());
     }
-    let config_path = config::resolve_config_path(cli.config.as_deref(), cli.user_home.as_deref())?;
+    let mut config_path =
+        config::resolve_config_path(cli.config.as_deref(), cli.user_home.as_deref())?;
     let mut settings = Settings::load(
         cli.config.as_deref(),
         cli.user_home.as_deref(),
@@ -206,43 +213,118 @@ fn main() -> Result<()> {
         Command::Update {
             scope, username, ..
         } => {
+            let persisted = service::load_service_config(&settings.user_home)?;
+            let saved_scope = persisted.as_ref().map(|saved| saved.scope);
+            if let (Some(requested), Some(saved)) = (scope, saved_scope)
+                && requested != saved
+            {
+                anyhow::bail!(
+                    "--scope {:?} does not match the installed service scope {:?}; omit --scope or reinstall the service",
+                    requested,
+                    saved
+                );
+            }
+            let scope = scope.or(saved_scope).unwrap_or(service::Scope::User);
+            let mut options = persisted
+                .as_ref()
+                .map(|saved| saved.options())
+                .unwrap_or_else(|| service::ServiceOptions {
+                    scope,
+                    service_type: service::ServiceType::default_for_scope(scope),
+                    autostart: service::ServiceType::default_for_scope(scope).default_autostart(),
+                    username: None,
+                    executable: service::installed_executable(&settings.user_home),
+                    config_path: config_path.clone(),
+                    user_home: settings.user_home.clone(),
+                    codex_home: settings.codex_home.clone(),
+                    state_dir: settings.state_dir.clone(),
+                });
+            // Command-line identity and path overrides remain authoritative
+            // for system-service updates; the rest comes from service.toml.
+            options.scope = scope;
+            options.username = username.or(options.username);
             #[cfg(unix)]
-            if matches!(scope, service::Scope::System)
-                && (username.is_none() || cli.user_home.is_none())
+            if matches!(options.scope, service::Scope::System)
+                && (options.username.is_none()
+                    || (cli.user_home.is_none() && persisted.as_ref().is_none()))
             {
                 anyhow::bail!(
                     "system service updates require --username and an explicit --user-home for the target user"
                 );
             }
-            let options = service::ServiceOptions {
-                scope,
-                username,
-                executable: service::installed_executable(&settings.user_home),
-                config_path,
-                user_home: settings.user_home,
-                codex_home: settings.codex_home,
-                state_dir: settings.state_dir,
-            };
             update::run(Some(&options))
         }
         Command::Service {
             action,
             scope,
-            username,
+            service_type,
+            autostart,
+            username: requested_username,
         } => {
-            #[cfg(windows)]
-            if matches!(action, service::Action::Install)
-                && matches!(scope, service::Scope::System)
-                && settings.config.auto_start_codex_app_server_daemon
+            // Reuse the persisted registration when management commands omit
+            // all backend options. An explicit --scope/--type always wins.
+            let persisted = service::load_service_config(&settings.user_home)?;
+            let explicit_scope = scope.is_some();
+            let explicit_type = service_type.is_some();
+            if cli.config.is_none()
+                && let Some(saved) = persisted.as_ref()
+                && saved.config_path != config_path
+            {
+                config_path = saved.config_path.clone();
+                settings = Settings::load(
+                    Some(&config_path),
+                    Some(&saved.user_home),
+                    Some(&saved.codex_home),
+                    cli.port,
+                )?;
+            }
+            let service_type = match (service_type, scope, autostart, persisted.as_ref()) {
+                (Some(value), _, _, _) => value,
+                (None, Some(scope), _, _) => service::ServiceType::default_for_scope(scope),
+                (None, None, _, Some(saved)) => saved.service_type,
+                (None, None, Some(service::Autostart::Startup), None) => {
+                    service::ServiceType::default_for_scope(service::Scope::System)
+                }
+                (None, None, Some(service::Autostart::Login), None) | (None, None, None, None) => {
+                    service::ServiceType::default_for_scope(service::Scope::User)
+                }
+            };
+            if !service_type.supported_on_current_platform() {
+                anyhow::bail!(
+                    "service type {:?} is not supported on this operating system",
+                    service_type
+                );
+            }
+            if let Some(requested_scope) = scope
+                && requested_scope != service_type.scope()
             {
                 anyhow::bail!(
-                    "Codex daemon auto-start requires a non-elevated user; use `service install --scope user` or disable auto_start_codex_app_server_daemon for a Windows system service"
+                    "--scope {:?} conflicts with --type {:?}; choose a matching service type",
+                    requested_scope,
+                    service_type
                 );
+            }
+            let scope = scope.unwrap_or_else(|| service_type.scope());
+            let autostart = autostart
+                .or_else(|| {
+                    (!explicit_scope && !explicit_type)
+                        .then(|| persisted.as_ref().map(|saved| saved.autostart))
+                        .flatten()
+                })
+                .unwrap_or_else(|| service_type.default_autostart());
+            #[allow(unused_mut)]
+            let mut username = requested_username
+                .or_else(|| persisted.as_ref().and_then(|saved| saved.username.clone()));
+            #[cfg(target_os = "macos")]
+            if matches!(service_type, service::ServiceType::LaunchDaemon) && username.is_none() {
+                username = Some(service::current_username()?);
             }
             #[cfg(unix)]
             if matches!(action, service::Action::Install)
                 && matches!(scope, service::Scope::System)
-                && (username.is_none() || cli.user_home.is_none())
+                && (username.is_none()
+                    || (cli.user_home.is_none()
+                        && !matches!(service_type, service::ServiceType::LaunchDaemon)))
             {
                 anyhow::bail!(
                     "system services require --username and an explicit --user-home for the target user"
@@ -303,6 +385,8 @@ fn main() -> Result<()> {
             }
             let options = service::ServiceOptions {
                 scope,
+                service_type,
+                autostart,
                 username,
                 executable: service::installed_executable(&settings.user_home),
                 config_path,
@@ -310,7 +394,22 @@ fn main() -> Result<()> {
                 codex_home: settings.codex_home,
                 state_dir: settings.state_dir,
             };
-            service::manage(action, &options)
+            let result = service::manage(action, &options);
+            if result.is_ok() {
+                match action {
+                    service::Action::Install => service::save_service_config(&options)?,
+                    service::Action::Uninstall
+                        if persisted.as_ref().is_none_or(|saved| {
+                            saved.service_type == options.service_type
+                                && saved.scope == options.scope
+                        }) =>
+                    {
+                        service::remove_service_config(&options.user_home)?
+                    }
+                    _ => {}
+                }
+            }
+            result
         }
         #[cfg(windows)]
         Command::ServiceRun => service::dispatch(move |stop| run(settings, Some(stop))),

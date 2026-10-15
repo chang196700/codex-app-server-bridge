@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[cfg(not(target_os = "macos"))]
@@ -9,10 +10,78 @@ const SERVICE_NAME: &str = "codex-app-server-bridge";
 #[cfg(unix)]
 const MANAGED_MARKER: &str = "Managed by codex-app-server-bridge";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Scope {
     User,
     System,
+}
+
+/// Concrete operating-system registration used by `service install`.
+///
+/// `user` and `system` retain the original scope-oriented interface and map
+/// to the native user/system registration on Linux.  The platform-specific
+/// variants make the Windows and macOS registration choice explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceType {
+    User,
+    #[value(alias = "service", alias = "windows-service")]
+    System,
+    #[value(alias = "task")]
+    ScheduledTask,
+    #[value(alias = "agent")]
+    LaunchAgent,
+    #[value(alias = "daemon")]
+    LaunchDaemon,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Autostart {
+    /// Start when the user's login/session starts.
+    #[default]
+    Login,
+    /// Start when the operating system starts, before user login where the
+    /// selected service manager supports it.
+    #[value(alias = "boot")]
+    Startup,
+}
+
+impl ServiceType {
+    pub fn scope(self) -> Scope {
+        match self {
+            Self::User | Self::ScheduledTask | Self::LaunchAgent => Scope::User,
+            Self::System | Self::LaunchDaemon => Scope::System,
+        }
+    }
+
+    /// Select the native registration for the old `--scope` interface.
+    pub fn default_for_scope(scope: Scope) -> Self {
+        match (cfg!(windows), cfg!(target_os = "macos"), scope) {
+            (true, _, Scope::User) => Self::User,
+            (true, _, Scope::System) => Self::System,
+            (false, true, Scope::User) => Self::LaunchAgent,
+            (false, true, Scope::System) => Self::LaunchDaemon,
+            (false, false, Scope::User) => Self::User,
+            (false, false, Scope::System) => Self::System,
+        }
+    }
+
+    pub fn supported_on_current_platform(self) -> bool {
+        match self {
+            Self::User | Self::System => cfg!(target_os = "linux") || cfg!(windows),
+            Self::ScheduledTask => cfg!(windows),
+            Self::LaunchAgent | Self::LaunchDaemon => cfg!(target_os = "macos"),
+        }
+    }
+
+    pub fn default_autostart(self) -> Autostart {
+        match self.scope() {
+            Scope::User => Autostart::Login,
+            Scope::System => Autostart::Startup,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -28,12 +97,120 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub struct ServiceOptions {
     pub scope: Scope,
+    pub service_type: ServiceType,
+    pub autostart: Autostart,
     pub username: Option<String>,
     pub executable: PathBuf,
     pub config_path: PathBuf,
     pub user_home: PathBuf,
     pub codex_home: PathBuf,
     pub state_dir: PathBuf,
+}
+
+/// Persisted registration metadata.  Runtime bridge settings remain in
+/// `config.toml`; this file records how that configuration is registered with
+/// the operating system so management commands can select the same service.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    #[serde(rename = "type")]
+    pub service_type: ServiceType,
+    #[serde(default)]
+    pub autostart: Autostart,
+    pub scope: Scope,
+    pub username: Option<String>,
+    pub executable: PathBuf,
+    pub config_path: PathBuf,
+    pub user_home: PathBuf,
+    pub codex_home: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl From<&ServiceOptions> for ServiceConfig {
+    fn from(options: &ServiceOptions) -> Self {
+        Self {
+            service_type: options.service_type,
+            autostart: options.autostart,
+            scope: options.scope,
+            username: options.username.clone(),
+            executable: options.executable.clone(),
+            config_path: options.config_path.clone(),
+            user_home: options.user_home.clone(),
+            codex_home: options.codex_home.clone(),
+            state_dir: options.state_dir.clone(),
+        }
+    }
+}
+
+impl ServiceConfig {
+    pub fn options(&self) -> ServiceOptions {
+        ServiceOptions {
+            scope: self.scope,
+            service_type: self.service_type,
+            autostart: self.autostart,
+            username: self.username.clone(),
+            executable: self.executable.clone(),
+            config_path: self.config_path.clone(),
+            user_home: self.user_home.clone(),
+            codex_home: self.codex_home.clone(),
+            state_dir: self.state_dir.clone(),
+        }
+    }
+}
+
+pub fn service_config_path(user_home: &Path) -> PathBuf {
+    user_home
+        .join(".codex-app-server-bridge")
+        .join("service.toml")
+}
+
+/// Save the registration metadata beside the fixed service executable.
+pub fn save_service_config(options: &ServiceOptions) -> Result<()> {
+    let path = service_config_path(&options.user_home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create service configuration directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let text = toml::to_string_pretty(&ServiceConfig::from(options))?;
+    crate::write_atomic(&path, text.as_bytes())?;
+    #[cfg(unix)]
+    if options.scope == Scope::System {
+        if let Some(username) = options.username.as_deref() {
+            // A system install is commonly executed through sudo. Keep the
+            // metadata readable by the service account that owns the fixed
+            // executable and configuration directory.
+            checked(std::process::Command::new("chown").arg(username).arg(&path))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read persisted registration metadata, if the service has been installed.
+pub fn load_service_config(user_home: &Path) -> Result<Option<ServiceConfig>> {
+    let path = service_config_path(user_home);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(toml::from_str(&text).with_context(|| {
+            format!("invalid service configuration {}", path.display())
+        })?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("read service configuration {}", path.display()))
+        }
+    }
+}
+
+pub fn remove_service_config(user_home: &Path) -> Result<()> {
+    let path = service_config_path(user_home);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove service configuration {}", path.display()))
+        }
+    }
 }
 
 pub fn installed_executable(user_home: &Path) -> PathBuf {
@@ -658,6 +835,20 @@ fn system_username(options: &ServiceOptions) -> Result<&str> {
     Ok(username)
 }
 
+/// Resolve the account running the installer.  LaunchDaemon and Windows
+/// registrations use this account by default so they do not silently fall
+/// back to root/LocalSystem.
+#[cfg(unix)]
+pub fn current_username() -> Result<String> {
+    let output = checked(std::process::Command::new("id").arg("-un"))?;
+    let username = String::from_utf8(output.stdout)?.trim().to_owned();
+    if username.is_empty() {
+        bail!("id returned an empty user name");
+    }
+    user_id(&username)?;
+    Ok(username)
+}
+
 #[cfg(unix)]
 fn prepare_system_files(options: &ServiceOptions, username: &str) -> Result<()> {
     // These are the two artifacts an elevated installer creates. Do not chown
@@ -692,6 +883,25 @@ mod platform {
     use super::*;
     use std::process::Command;
 
+    fn validate_registration(options: &ServiceOptions) -> Result<()> {
+        let expected = match options.service_type {
+            ServiceType::User => Autostart::Login,
+            ServiceType::System => Autostart::Startup,
+            other => bail!("service type {other:?} is not supported on Linux"),
+        };
+        if options.autostart != expected {
+            bail!(
+                "Linux {:?} service requires --autostart {}",
+                options.service_type,
+                match expected {
+                    Autostart::Login => "login",
+                    Autostart::Startup => "startup",
+                }
+            );
+        }
+        Ok(())
+    }
+
     fn quote(value: &str, exec: bool) -> String {
         let escaped = value
             .replace('\\', "\\\\")
@@ -724,6 +934,7 @@ mod platform {
     }
 
     pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        validate_registration(options)?;
         let path = unit_path(options);
         let Some(content) = previous_definition(&path)? else {
             // No installation for this scope/home. In particular, do not need
@@ -815,6 +1026,7 @@ mod platform {
     }
 
     pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
+        validate_registration(options)?;
         let path = unit_path(options);
         let name = format!("{SERVICE_NAME}.service");
         match action {
@@ -972,8 +1184,38 @@ mod platform {
             .replace('\'', "&apos;")
     }
 
-    fn domain(scope: Scope) -> Result<String> {
-        if scope == Scope::System {
+    fn launch_kind(options: &ServiceOptions) -> Result<ServiceType> {
+        let kind = options.service_type;
+        if !matches!(kind, ServiceType::LaunchAgent | ServiceType::LaunchDaemon) {
+            bail!(
+                "service type {:?} is not supported on macOS; use --type launch-agent or --type launch-daemon",
+                kind
+            );
+        }
+        let expected = match kind {
+            ServiceType::LaunchAgent => Autostart::Login,
+            ServiceType::LaunchDaemon => Autostart::Startup,
+            _ => unreachable!(),
+        };
+        if options.autostart != expected {
+            bail!(
+                "macOS {} requires --autostart {}",
+                match kind {
+                    ServiceType::LaunchAgent => "launch-agent",
+                    ServiceType::LaunchDaemon => "launch-daemon",
+                    _ => unreachable!(),
+                },
+                match expected {
+                    Autostart::Login => "login",
+                    Autostart::Startup => "startup",
+                }
+            );
+        }
+        Ok(kind)
+    }
+
+    fn domain(kind: ServiceType) -> Result<String> {
+        if kind == ServiceType::LaunchDaemon {
             return Ok("system".into());
         }
         let output = checked(Command::new("id").arg("-u"))?;
@@ -1013,9 +1255,11 @@ mod platform {
     }
 
     pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
-        let directory = match options.scope {
-            Scope::User => options.user_home.join("Library/LaunchAgents"),
-            Scope::System => PathBuf::from("/Library/LaunchDaemons"),
+        let kind = launch_kind(options)?;
+        let directory = match kind {
+            ServiceType::LaunchAgent => options.user_home.join("Library/LaunchAgents"),
+            ServiceType::LaunchDaemon => PathBuf::from("/Library/LaunchDaemons"),
+            _ => unreachable!(),
         };
         let path = directory.join(format!("{LABEL}.plist"));
         if previous_definition(&path)?.is_none() {
@@ -1023,7 +1267,7 @@ mod platform {
             // service is installed. An uninstall deliberately retains binaries.
             return Ok(None);
         }
-        let target = format!("{}/{LABEL}", domain(options.scope)?);
+        let target = format!("{}/{LABEL}", domain(kind)?);
         let is_loaded = loaded(&target)?;
         let extract = |key: &str, format: &str| -> Result<Vec<u8>> {
             Ok(checked(
@@ -1047,7 +1291,7 @@ mod platform {
         if actual != expected {
             bail!("existing launchd service uses a different executable or configuration file");
         }
-        if options.scope == Scope::System {
+        if kind == ServiceType::LaunchDaemon {
             let username = String::from_utf8(extract("UserName", "raw")?)?;
             if username.trim() != system_username(options)? {
                 bail!("existing launchd service runs as a different user");
@@ -1088,12 +1332,14 @@ mod platform {
     }
 
     pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
-        let directory = match options.scope {
-            Scope::User => options.user_home.join("Library/LaunchAgents"),
-            Scope::System => PathBuf::from("/Library/LaunchDaemons"),
+        let kind = launch_kind(options)?;
+        let directory = match kind {
+            ServiceType::LaunchAgent => options.user_home.join("Library/LaunchAgents"),
+            ServiceType::LaunchDaemon => PathBuf::from("/Library/LaunchDaemons"),
+            _ => unreachable!(),
         };
         let path = directory.join(format!("{LABEL}.plist"));
-        let domain = domain(options.scope)?;
+        let domain = domain(kind)?;
         let target = format!("{domain}/{LABEL}");
         match action {
             Action::Install => {
@@ -1102,7 +1348,7 @@ mod platform {
                 if was_loaded && previous.is_none() {
                     bail!("refusing to replace an unmanaged launchd job {target}");
                 }
-                let identity = if options.scope == Scope::System {
+                let identity = if kind == ServiceType::LaunchDaemon {
                     let username = system_username(options)?;
                     prepare_system_files(options, username)?;
                     format!("<key>UserName</key><string>{}</string>\n", xml(username))
@@ -1222,7 +1468,7 @@ mod platform {
         Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceControl,
         ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
         ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
-        ServiceType,
+        ServiceType as WinServiceType,
     };
     use windows_service::service_control_handler::{
         self, ServiceControlHandlerResult, ServiceStatusHandle,
@@ -1262,7 +1508,7 @@ mod platform {
 
     fn service_status(state: ServiceState, failed: bool) -> ServiceStatus {
         ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
+            service_type: WinServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: if state == ServiceState::Running {
                 ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
@@ -1331,12 +1577,33 @@ mod platform {
     }
 
     pub fn manage(action: Action, options: &ServiceOptions) -> Result<()> {
-        if options.username.is_some() {
-            bail!("--username is only supported for Linux and macOS system services");
-        }
-        match options.scope {
-            Scope::User => manage_autostart(action, options),
-            Scope::System => manage_system(action, options),
+        match options.service_type {
+            ServiceType::User => {
+                if options.autostart != Autostart::Login {
+                    bail!(
+                        "Windows user startup requires --autostart login; use --type scheduled-task for startup"
+                    )
+                }
+                if options.username.is_some() {
+                    bail!("--username is not supported for Windows user startup");
+                }
+                manage_autostart(action, options)
+            }
+            ServiceType::ScheduledTask => manage_scheduled_task(action, options),
+            ServiceType::System => {
+                if options.autostart != Autostart::Startup {
+                    bail!(
+                        "Windows system services require --autostart startup; use --type scheduled-task --autostart login for login startup"
+                    )
+                }
+                if options.username.is_some() {
+                    bail!(
+                        "--username is not supported for Windows system services; the current Windows account is used"
+                    )
+                }
+                manage_system(action, options)
+            }
+            other => bail!("service type {other:?} is not supported on Windows"),
         }
     }
 
@@ -1388,12 +1655,29 @@ mod platform {
         matches!(error, windows_service::Error::Winapi(error) if error.raw_os_error() == Some(1060))
     }
 
-    pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
-        if options.username.is_some() {
-            bail!("--username is only supported for Linux and macOS system services");
+    /// Return the account that invoked installation.  SCM requires a
+    /// password when a service runs as an ordinary account; keeping the
+    /// account explicit lets Windows report that requirement instead of
+    /// silently falling back to LocalSystem.
+    fn current_windows_account() -> OsString {
+        let user = std::env::var_os("USERNAME").unwrap_or_else(|| OsString::from(""));
+        let domain = std::env::var_os("USERDOMAIN").unwrap_or_default();
+        if domain.is_empty() {
+            user
+        } else {
+            let mut account = domain;
+            account.push("\\");
+            account.push(user);
+            account
         }
-        let (command, running) = match options.scope {
-            Scope::User => {
+    }
+
+    pub fn inspect_installed(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        let (command, running) = match options.service_type {
+            ServiceType::User => {
+                if options.autostart != Autostart::Login {
+                    bail!("Windows user startup requires --autostart login")
+                }
                 let Some(command) = current_autostart(&RegKey::predef(HKEY_CURRENT_USER))? else {
                     return Ok(None);
                 };
@@ -1402,7 +1686,11 @@ mod platform {
                     autostart_running(options)?,
                 )
             }
-            Scope::System => {
+            ServiceType::ScheduledTask => return inspect_scheduled_task(options),
+            ServiceType::System => {
+                if options.autostart != Autostart::Startup {
+                    bail!("Windows system services require --autostart startup")
+                }
                 let manager =
                     ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
                         .context("open Windows Service Control Manager")?;
@@ -1416,7 +1704,7 @@ mod platform {
                 };
                 let config = service.query_config()?;
                 if config.display_name != OsStr::new("Codex app-server WebSocket bridge")
-                    || config.service_type != ServiceType::OWN_PROCESS
+                    || config.service_type != WinServiceType::OWN_PROCESS
                 {
                     bail!("refusing to update an unmanaged Windows service {SERVICE_NAME}");
                 }
@@ -1433,6 +1721,7 @@ mod platform {
                     running,
                 )
             }
+            other => bail!("service type {other:?} is not supported on Windows"),
         };
         if !same_path(Path::new(&command[0]), &options.executable)? {
             bail!("existing Windows service uses a different executable");
@@ -1452,13 +1741,13 @@ mod platform {
             let info = ServiceInfo {
                 name: SERVICE_NAME.into(),
                 display_name: "Codex app-server WebSocket bridge".into(),
-                service_type: ServiceType::OWN_PROCESS,
+                service_type: WinServiceType::OWN_PROCESS,
                 start_type: ServiceStartType::AutoStart,
                 error_control: ServiceErrorControl::Normal,
                 executable_path: options.executable.clone(),
                 launch_arguments: arguments(options, "service-run"),
                 dependencies: vec![],
-                account_name: None,
+                account_name: Some(current_windows_account()),
                 account_password: None,
             };
             let access = ServiceAccess::QUERY_STATUS
@@ -1475,7 +1764,7 @@ mod platform {
             let previous = if let Some(service) = &service {
                 let config = service.query_config()?;
                 if config.display_name != OsStr::new("Codex app-server WebSocket bridge")
-                    || config.service_type != ServiceType::OWN_PROCESS
+                    || config.service_type != WinServiceType::OWN_PROCESS
                 {
                     bail!("refusing to modify an unmanaged Windows service {SERVICE_NAME}");
                 }
@@ -1509,9 +1798,17 @@ mod platform {
                 }
                 executable.apply()?;
                 if let Some(service) = &service {
-                    service.change_config(&info)?;
+                    service.change_config(&info).map_err(|error| {
+                        anyhow::anyhow!(
+                            "configure Windows system service for the current account requires the account password; use `--type scheduled-task` for passwordless installation ({error})"
+                        )
+                    })?;
                 } else {
-                    service = Some(manager.create_service(&info, access)?);
+                    service = Some(manager.create_service(&info, access).map_err(|error| {
+                    anyhow::anyhow!(
+                        "create Windows system service under the current account requires the account password; use `--type scheduled-task` for passwordless installation ({error})"
+                    )
+                })?);
                 }
                 let service = service.as_ref().context("missing installed service")?;
                 service.set_description(
@@ -1612,6 +1909,217 @@ mod platform {
             Action::Stop => stop_service(&service)?,
             Action::Status => println!("{:?}", service.query_status()?),
             Action::Install | Action::Restart => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn scheduled_task_command(options: &ServiceOptions) -> String {
+        let mut args = vec![options.executable.as_os_str().to_owned()];
+        args.extend(arguments(options, "hidden-start"));
+        args.iter()
+            .map(|arg| quote_argument(arg.to_str().expect("validated Unicode service arguments")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn run_schtasks(args: &[String]) -> Result<std::process::Output> {
+        let output = std::process::Command::new("schtasks.exe")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("execute schtasks.exe")?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr);
+            let message = if message.trim().is_empty() {
+                String::from_utf8_lossy(&output.stdout)
+            } else {
+                message
+            };
+            bail!(
+                "schtasks.exe {} failed ({}): {}",
+                args.join(" "),
+                output.status,
+                message.trim()
+            );
+        }
+        Ok(output)
+    }
+
+    fn scheduled_task_query() -> Result<Option<Vec<u8>>> {
+        let output = std::process::Command::new("schtasks.exe")
+            .args(["/Query", "/TN", SERVICE_NAME, "/FO", "XML"])
+            .output()
+            .context("query Windows scheduled task")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("cannot find")
+                || stderr.contains("does not exist")
+                || stderr.contains("找不到")
+            {
+                return Ok(None);
+            }
+            bail!(
+                "query scheduled task {SERVICE_NAME} failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(Some(output.stdout))
+    }
+
+    fn inspect_scheduled_task(options: &ServiceOptions) -> Result<Option<InstalledService>> {
+        let Some(xml) = scheduled_task_query()? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8_lossy(&xml);
+        let executable = path_text(&options.executable)?;
+        let config = path_text(&options.config_path)?;
+        if !text.contains(executable) || !text.contains(config) {
+            bail!("refusing to update an unmanaged Windows scheduled task {SERVICE_NAME}");
+        }
+        Ok(Some(InstalledService {
+            running: runtime_running(options)?,
+        }))
+    }
+
+    fn stop_scheduled_task(options: &ServiceOptions) -> Result<()> {
+        if !runtime_running(options)? {
+            return Ok(());
+        }
+        // The scheduled task launches `hidden-start`, which in turn detaches
+        // the bridge process.  Ending the task would therefore leave the
+        // bridge alive; use its graceful stop-file protocol instead.
+        let pid = runtime_pid(options)?;
+        crate::write_atomic(
+            &options.state_dir.join("stop.request"),
+            pid.to_string().as_bytes(),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while runtime_running(options)? {
+            if runtime_pid(options).ok() != Some(pid) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "scheduled task did not stop within 30 seconds; inspect {}",
+                    options.state_dir.join("logs/bridge.log").display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Ok(())
+    }
+
+    fn start_scheduled_task(options: &ServiceOptions) -> Result<()> {
+        if runtime_running(options)? {
+            println!("Bridge is already running");
+            return Ok(());
+        }
+        run_schtasks(&["/Run".into(), "/TN".into(), SERVICE_NAME.into()])?;
+        wait_for_runtime(options, status_pid(options))
+    }
+
+    fn register_scheduled_task(options: &ServiceOptions) -> Result<()> {
+        let trigger = match options.autostart {
+            Autostart::Login => "ONLOGON",
+            Autostart::Startup => "ONSTART",
+        };
+        let command = scheduled_task_command(options);
+        let mut args = vec![
+            "/Create".into(),
+            "/TN".into(),
+            SERVICE_NAME.into(),
+            "/TR".into(),
+            command,
+            "/SC".into(),
+            trigger.into(),
+            "/F".into(),
+        ];
+        // ONLOGON uses the current interactive token and needs no password.
+        // ONSTART names the current account and requests Task Scheduler's
+        // passwordless batch-token mode. Windows may still reject it when
+        // that account lacks the "Log on as a batch job" right.
+        if options.autostart == Autostart::Startup {
+            args.extend([
+                "/RU".into(),
+                current_windows_account().to_string_lossy().into_owned(),
+                "/NP".into(),
+            ]);
+        }
+        run_schtasks(&args).map(|_| ()).map_err(|error| {
+            if options.autostart == Autostart::Startup {
+                error.context(
+                    "Windows startup scheduled tasks require the current account to allow passwordless batch-logon; grant the Log on as a batch job right or use login autostart",
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn manage_scheduled_task(action: Action, options: &ServiceOptions) -> Result<()> {
+        if options.username.is_some() {
+            bail!(
+                "--username is not supported for Windows scheduled tasks; the current account is used"
+            );
+        }
+        match action {
+            Action::Install => {
+                let previous = inspect_scheduled_task(options)?;
+                let was_running = previous.as_ref().is_some_and(|service| service.running);
+                if was_running {
+                    stop_scheduled_task(options)?;
+                }
+                let mut executable = ExecutableInstall::stage(options)?;
+                let old_pid = status_pid(options);
+                let result = (|| -> Result<()> {
+                    executable.apply()?;
+                    register_scheduled_task(options)?;
+                    start_scheduled_task(options)?;
+                    wait_for_runtime(options, old_pid)
+                })();
+                if let Err(error) = result {
+                    let recovery = (|| -> Result<()> {
+                        let _ = stop_scheduled_task(options);
+                        executable.rollback()?;
+                        if was_running {
+                            register_scheduled_task(options)?;
+                            start_scheduled_task(options)?;
+                        }
+                        Ok(())
+                    })();
+                    return Err(installation_failure(error, recovery));
+                }
+                executable.commit();
+                println!(
+                    "Installed {} as Windows scheduled task {SERVICE_NAME}",
+                    options.executable.display()
+                );
+            }
+            Action::Uninstall => {
+                if scheduled_task_query()?.is_none() {
+                    return Ok(());
+                }
+                stop_scheduled_task(options)?;
+                run_schtasks(&[
+                    "/Delete".into(),
+                    "/TN".into(),
+                    SERVICE_NAME.into(),
+                    "/F".into(),
+                ])?;
+                println!("Uninstalled Windows scheduled task {SERVICE_NAME}");
+            }
+            Action::Start => start_scheduled_task(options)?,
+            Action::Stop => stop_scheduled_task(options)?,
+            Action::Status => {
+                let installed = inspect_scheduled_task(options)?
+                    .context("service is not installed; run `service install` first")?;
+                println!(
+                    "Scheduled task installed; bridge running: {}",
+                    installed.running
+                );
+            }
+            Action::Restart => unreachable!("restart is handled by the service dispatcher"),
         }
         Ok(())
     }

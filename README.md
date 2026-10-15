@@ -4,7 +4,7 @@ English | [简体中文](README_ZH.md)
 
 A Rust program that exposes Codex app-server at `ws://127.0.0.1:<port>/`. By default it starts one `codex app-server proxy` process per WebSocket client and carries the proxy's STDIO byte stream over WebSocket; it does not depend on Codex's control-socket path. An optional direct `socket` transport is available for compatibility. It can optionally set the user environment variable `CODEX_APP_SERVER_WS_URL`; this is disabled by default.
 
-Supports Windows, macOS, and Linux, with fixed or dynamic ports and background services or login startup. It can optionally start the Codex app-server daemon when it is not running; this is disabled by default. In the default proxy mode, Codex owns discovery and lifecycle of its control endpoint.
+Supports Windows, macOS, and Linux, with multiple WebSocket listeners, fixed or dynamic ports, and background services or login startup. It can optionally start the Codex app-server daemon when it is not running; this is disabled by default. In the default proxy mode, Codex owns discovery and lifecycle of its control endpoint.
 
 ## Downloads and automatic releases
 
@@ -129,9 +129,30 @@ connect_timeout_ms = 3000       # Connection and handshake timeout; at least 100
 max_connections = 64
 max_message_size = 67108864     # Bridge message/frame limit; Codex upstream limits still apply
 publish_codex_app_server_ws_url_environment = false  # Disabled by default; true enables automatic user environment updates
+# Optional authentication; omit both fields to allow clients without a token.
+# Use only one of auth_token_file and auth_token.
+# auth_token_file = "~/.codex-app-server-bridge/websocket.token"
+# auth_token = "replace-with-a-long-random-token"
 ```
 
-WebSocket settings belong in the `[websocket]` table. Before upgrading a configuration that has top-level `host`, `port`, `connect_timeout_ms`, `max_connections`, `max_message_size`, or `publish_codex_app_server_ws_url_environment`, move those fields into `[websocket]`; the old locations are rejected and are not migrated automatically. Keep `poll_interval_ms`, transport, daemon, and path settings at the top level, before `[websocket]`.
+The default WebSocket listener uses the `[websocket]` table. Before upgrading a configuration that has top-level `host`, `port`, `connect_timeout_ms`, `max_connections`, `max_message_size`, or `publish_codex_app_server_ws_url_environment`, move those fields into `[websocket]`; the old locations are rejected and are not migrated automatically. Keep `poll_interval_ms`, transport, daemon, and path settings at the top level, before `[websocket]`.
+
+Add named listeners with `[websockets.<name>]`. Names must be nonempty and cannot contain dots or control characters:
+
+```toml
+[websockets.tools]
+host = "127.0.0.1"
+port = 63101
+connect_timeout_ms = 3000
+max_connections = 32
+max_message_size = 67108864
+
+[websockets.ipv6]
+host = "::1"
+port = 0
+```
+
+All listeners share the top-level Codex transport, daemon, and path settings. Each listener has its own port, connection limit, message limit, connection timeout, and optional authentication; omitted fields use the built-in defaults rather than inheriting `[websocket]`, including its authentication settings. A port of `0` selects a dynamic port independently for each listener. Named listeners do not support `publish_codex_app_server_ws_url_environment`: specifying it is an error, even when set to `false`. Only the default `[websocket]` listener can publish `CODEX_APP_SERVER_WS_URL`.
 
 Configuration precedence:
 
@@ -143,7 +164,7 @@ Configuration precedence:
 | Upstream transport | TOML `transport` → `proxy` (Codex `app-server proxy` over STDIO) |
 | Socket path | Used only when `transport = "socket"`; TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex executable | TOML `codex_path` → automatic detection on `PATH` and in common installation locations |
-| Port | `--port` → TOML `websocket.port` → `0` |
+| Default listener port | `--port` → TOML `websocket.port` → `0`; named listener ports come from `websockets.<name>.port` |
 
 A TOML `user_home` value takes effect after the configuration is read; it does not change which configuration file is selected. A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. When editing a service's paths afterward, use absolute paths or `~` so they do not depend on the service manager's working directory. Unknown TOML fields are rejected so that typos are not silently ignored.
 
@@ -154,6 +175,10 @@ codex-app-server-bridge config list
 codex-app-server-bridge config get websocket.port
 codex-app-server-bridge config set websocket.port 8765
 codex-app-server-bridge config set websocket.publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config set websockets.tools.port 63101
+codex-app-server-bridge config get websockets.tools.port
+codex-app-server-bridge config set websockets.tools.auth_token_file '~/.codex-app-server-bridge/tools.token'
+codex-app-server-bridge config get websockets.tools.auth_token_file
 codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
@@ -172,7 +197,7 @@ codex-app-server-bridge --config /path/to/bridge.toml config set websocket.port 
 
 `config set KEY VALUE` accepts a value matching the field's type. Numbers and booleans use TOML syntax; string fields, including paths and `websocket.host`, also accept plain strings as shown above. There is no special unset or `null` syntax for removing a field. The command creates a missing configuration file, including one selected with `--config`, preserves other fields and comments, validates the complete configuration before writing, and prints the saved value as JSON. It does not write runtime overrides into the file.
 
-Configuration keys support dot-separated path navigation: use `websocket.port` for a field in `[websocket]`, and `transport` or `socket_path` for a top-level field. Unknown fields or subkeys are rejected.
+Configuration keys support dot-separated path navigation: use `websocket.port` for a field in `[websocket]`, `websockets.tools.port` for a named listener, and `transport` or `socket_path` for a top-level field. Setting a field under a new listener name creates that listener. Unknown fields or subkeys are rejected.
 
 The service reads the same configuration file that `config list`, `config get`, and `config set` select: the default `~/.codex-app-server-bridge/config.toml`, or the file supplied with `--config` at installation. Configuration changes do not reload a running instance. Restart a foreground process, or use `service restart` for an installed service; an operating-system service restart or reboot also applies the changes. Starting a stopped service reads the file again.
 
@@ -186,6 +211,36 @@ codex-app-server-bridge --config /path/to/bridge.toml service restart --scope us
 ```
 
 Changes to `user_home` or `state_dir` affect installation or runtime locations. Stop the service before editing those fields, then run `service install` with the intended home and configuration selection; do not rely on a simple restart to relocate an installation.
+
+## Authenticate a WebSocket listener
+
+Both `[websocket]` and `[websockets.<name>]` accept an optional `auth_token` or `auth_token_file`. Omit both to disable authentication, which is the default. The two fields are mutually exclusive for each listener. Named listeners do not inherit the default listener's token.
+
+Prefer `auth_token_file` to keep the token outside the TOML configuration. The file contains only the token, optionally followed by a line ending, and must be readable by the account running the bridge. Token files must not exceed 64 KiB, including line endings. For example, the default listener can remain available without a token and publish its URL, while another port requires its own token:
+
+```toml
+[websocket]
+port = 63100
+publish_codex_app_server_ws_url_environment = true
+
+[websockets.tools]
+port = 63101
+auth_token_file = "~/.codex-app-server-bridge/tools.token"
+# Alternatively, replace auth_token_file with:
+# auth_token = "replace-with-a-long-random-token"
+```
+
+The bridge reads each token file once at startup and removes trailing CR/LF characters. An unreadable file, an empty token, or an invalid token prevents startup. Tokens use the RFC 6750 Bearer-token syntax: one or more ASCII letters, digits, or `-._~+/` characters, optionally followed by trailing `=` characters; embedded whitespace is not allowed. Restart the bridge after changing the file. Token file paths follow the same `~` expansion and relative-path rules as other configuration paths. Both fields support `config get` and `config set`, for example `config set websockets.tools.auth_token_file '~/.codex-app-server-bridge/tools.token'`. Inline `auth_token` values appear in `config list` and `config get` output; a token file keeps the token out of that configuration output.
+
+Configure a native WebSocket client to connect to `ws://127.0.0.1:63101/` and include this HTTP handshake header, replacing the example value with the token from the file:
+
+```http
+Authorization: Bearer replace-with-a-long-random-token
+```
+
+This uses the `Authorization: Bearer <token>` handshake header described in the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server#protocol). The bridge checks its configured static token before accepting the WebSocket connection, before any `initialize` message. Missing or incorrect credentials receive HTTP `401 Unauthorized`. Validation happens locally in the bridge; the token is not forwarded to Codex. This implementation compares a static capability token and does not validate signed JWTs.
+
+Tokens are not included in WebSocket URLs, runtime status, or published environment variables. `CODEX_APP_SERVER_WS_URL` supplies only the URL, so a client connecting to an authenticated listener must support setting the Bearer header separately. Keep the default listener unauthenticated if the client only accepts that environment variable. All listeners remain restricted to loopback addresses.
 
 ## Start the Codex daemon automatically
 
@@ -203,7 +258,7 @@ On Windows, automatic daemon startup requires an ordinary, non-elevated user pro
 
 ## How environment updates work
 
-Automatic environment updates are **disabled by default**, including when `websocket.publish_codex_app_server_ws_url_environment` is omitted. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
+Automatic environment updates are **disabled by default**, including when `websocket.publish_codex_app_server_ws_url_environment` is omitted. Only the default `[websocket]` listener can publish its URL; named `[websockets.<name>]` listeners never publish environment variables. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
 
 To set `CODEX_APP_SERVER_WS_URL` automatically, enable this option in `~/.codex-app-server-bridge/config.toml`:
 
@@ -250,6 +305,10 @@ The installation directory follows the selected `user_home`, regardless of where
 
 `service install` registers and immediately starts the service or startup entry. Running it again updates the registration and restarts the instance. The registration points directly to the selected configuration file. Installation saves the necessary user identity, Codex directory, command-line overrides, and resolved Codex executable path to that same file while preserving comments and unrelated settings. Configured paths are made absolute for service use; omitted `socket_path` and `state_dir` remain derived defaults instead of being frozen into explicit values. Proxy services always resolve and save the selected `codex_path` so they can start under a minimal service environment. Changes to ordinary settings such as the port or daemon options take effect after `service restart`, without reinstalling. Startup modes sharing a state directory also share an instance lock. Do not install both user and system startup modes for the same state directory.
 
+The selected registration is also saved in `~/.codex-app-server-bridge/service.toml`. It records `type`, `autostart`, identity, executable, configuration, Codex home, and state directory. `service status`, `start`, `stop`, `restart`, `uninstall`, and `update` reuse this file when their backend options are omitted. The runtime bridge settings remain in `config.toml`.
+
+Use `--type` to select the native registration and `--autostart login|startup` to select its trigger. Linux uses `user` or `system`; Windows supports `user` (Run-key login startup), `system` (native SCM service), and `scheduled-task`; macOS supports `launch-agent` and `launch-daemon`. The native backends validate incompatible combinations, such as `launch-daemon` with `login`.
+
 On Linux, the generated systemd unit stops only the bridge process, preserving the independent Codex daemon across bridge stops and restarts.
 
 ### Windows: start at user login
@@ -271,11 +330,11 @@ Installation explicitly fails if the Run command exceeds 260 UTF-16 characters. 
 
 ### Windows: native system service
 
-Run these commands in an **elevated administrator PowerShell session belonging to the target user**. Avoid installing as a different administrator account. Installation records the current user's SID. SCM runs the service as `LocalSystem`, and environment updates target the recorded user rather than LocalSystem's own user environment.
+Run these commands in an **elevated administrator PowerShell session belonging to the target user**. The service is registered to run as the account that invokes installation; Windows may require that account's logon credentials. This mode starts at operating-system startup.
 
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
-& $bridge --user-home 'C:\Users\alice' --codex-home 'C:\Users\alice\.codex' service install --scope system
+& $bridge --user-home 'C:\Users\alice' --codex-home 'C:\Users\alice\.codex' service install --type system --autostart startup
 $bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope system
 & $bridge service stop --scope system
@@ -284,7 +343,20 @@ $bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service uninstall --scope system
 ```
 
-Replace the example username and paths with your actual values. The service is named `codex-app-server-bridge` and uses delayed automatic startup. SCM attempts to restart it after an unexpected exit. `--username` does not apply on Windows.
+Replace the example paths with your actual values. The service is named `codex-app-server-bridge`; SCM attempts to restart it after an unexpected exit. `--username` does not apply on Windows.
+
+### Windows: scheduled task
+
+Use a scheduled task when the bridge should run as the current user without installing an SCM service. It supports both login and startup triggers:
+
+```powershell
+& $bridge service install --type scheduled-task --autostart login
+# or: --autostart startup
+```
+
+Startup tasks use a passwordless batch token. If Windows rejects that registration, grant the current account “Log on as a batch job” or use the login trigger.
+
+The startup trigger uses a passwordless batch token for the current account. If Windows rejects it, grant that account the **Log on as a batch job** right or use the login trigger.
 
 ### Linux: systemd user service
 
@@ -345,7 +417,7 @@ The configuration file is `~/Library/LaunchAgents/io.codex.app-server-bridge.pli
 ```sh
 sudo ./target/release/codex-app-server-bridge \
   --user-home /Users/alice --codex-home /Users/alice/.codex \
-  service install --scope system --username alice
+  service install --type launch-daemon --autostart startup
 
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service status --scope system --username alice
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service stop --scope system --username alice
@@ -354,7 +426,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
-The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`. Its `UserName` setting runs the process as the specified user. If the user directory or Codex home is unavailable before login, the bridge still depends on those resources becoming available. A LaunchDaemon cannot unlock encrypted user data in advance.
+The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`. Its `UserName` setting runs the process as the current user by default. If the user directory or Codex home is unavailable before login, the bridge still depends on those resources becoming available. A LaunchDaemon cannot unlock encrypted user data in advance.
 
 ### Uninstall and logs
 
@@ -368,7 +440,7 @@ The configuration file is `/Library/LaunchDaemons/io.codex.app-server-bridge.pli
 | Linux system service | `sudo journalctl -u codex-app-server-bridge -f` |
 | macOS launchd | `<state_dir>/service.stdout.log` and `service.stderr.log` |
 
-`status` checks the instance lock and reports runtime state, including the selected transport. `service status` queries the OS startup entry or service status. A running service does not necessarily mean the Codex upstream is ready; check the `ready` field from `status`.
+`status` checks the instance lock and reports runtime state, including the selected transport. Its top-level `url` and `ready` describe the default listener; `websockets.<name>.url` and `websockets.<name>.ready` describe each named listener. These URLs include the actual assigned ports, including dynamic ports. `service status` queries the OS startup entry or service status. A running service does not necessarily mean the Codex upstream is ready; check the listener's `ready` field from `status`.
 
 ## Protocol and access
 
@@ -378,7 +450,7 @@ Each client connection has its own upstream connection; proxy mode starts and re
 
 The bridge listens only on loopback addresses and accepts only the root path `/`. It rejects query parameters and handshakes containing `Origin`; `Host` must match the published URL. Other paths, such as `/daemon/shutdown`, are not forwarded. Connections from browser pages are rejected; use a native WebSocket client.
 
-The bridge does not add token authentication. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex app-server WebSocket protocol exposed by proxy or the direct control endpoint. Other versions require revalidation if they change the handshake or protocol.
+Each listener can require the optional [Bearer token authentication](#authenticate-a-websocket-listener) described above. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex app-server WebSocket protocol exposed by proxy or the direct control endpoint. Other versions require revalidation if they change the handshake or protocol.
 
 ## License
 

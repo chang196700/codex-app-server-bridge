@@ -8,9 +8,11 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
-    io,
+    io::{self, Read},
     net::SocketAddr,
     sync::{
         Arc,
@@ -31,7 +33,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         handshake::server::{ErrorResponse, Request, Response},
-        http::StatusCode,
+        http::{HeaderValue, StatusCode, header::WWW_AUTHENTICATE},
         protocol::WebSocketConfig,
     },
 };
@@ -45,9 +47,86 @@ struct Status<'a> {
     codex_path: Option<&'a std::path::Path>,
     socket_path: Option<&'a std::path::Path>,
     updated_at_unix: u64,
+    websockets: BTreeMap<String, EndpointStatus>,
 }
 
-fn write_status(settings: &Settings, url: &str, ready: bool) -> Result<()> {
+#[derive(Debug, Clone, Serialize)]
+struct EndpointStatus {
+    url: String,
+    ready: bool,
+}
+
+#[derive(Clone, Copy)]
+struct AuthToken {
+    digest: [u8; 32],
+}
+
+impl AuthToken {
+    fn from_token(token: &str) -> Result<Self> {
+        crate::config::validate_auth_token(token)?;
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let digest = hasher.finalize().into();
+        Ok(Self { digest })
+    }
+
+    fn matches(&self, token: &str) -> bool {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let digest = hasher.finalize();
+        let mut difference = 0u8;
+        for (expected, actual) in self.digest.iter().zip(digest.iter()) {
+            difference |= expected ^ actual;
+        }
+        difference == 0
+    }
+}
+
+const MAX_AUTH_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+
+fn load_auth_token(config: &crate::config::WebSocketConfig) -> Result<Option<AuthToken>> {
+    if let Some(token) = &config.auth_token {
+        return AuthToken::from_token(token).map(Some);
+    }
+    let Some(path) = &config.auth_token_file else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "open WebSocket authentication token file {}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTH_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "read WebSocket authentication token file {}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_AUTH_TOKEN_FILE_BYTES {
+        bail!(
+            "WebSocket authentication token file {} exceeds 64 KiB",
+            path.display()
+        );
+    }
+    let token = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "WebSocket authentication token file {} is not UTF-8",
+            path.display()
+        )
+    })?;
+    AuthToken::from_token(token.trim_end_matches(['\r', '\n'])).map(Some)
+}
+
+fn write_status(
+    settings: &Settings,
+    url: &str,
+    ready: bool,
+    websockets: &BTreeMap<String, EndpointStatus>,
+) -> Result<()> {
     let state = Status {
         pid: std::process::id(),
         ready,
@@ -56,6 +135,7 @@ fn write_status(settings: &Settings, url: &str, ready: bool) -> Result<()> {
         codex_path: settings.config.codex_path.as_deref(),
         socket_path: settings.socket_path.as_deref(),
         updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        websockets: websockets.clone(),
     };
     crate::write_atomic(
         &settings.state_dir.join("status.json"),
@@ -63,10 +143,10 @@ fn write_status(settings: &Settings, url: &str, ready: bool) -> Result<()> {
     )
 }
 
-fn ws_config(settings: &Settings) -> WebSocketConfig {
+fn ws_config(config: &crate::config::WebSocketConfig) -> WebSocketConfig {
     WebSocketConfig::default()
-        .max_message_size(Some(settings.config.websocket.max_message_size))
-        .max_frame_size(Some(settings.config.websocket.max_message_size))
+        .max_message_size(Some(config.max_message_size))
+        .max_frame_size(Some(config.max_message_size))
 }
 
 /// A bidirectional async stream backed by one Codex `app-server proxy`
@@ -203,8 +283,11 @@ async fn proxy_stream(settings: &Settings) -> Result<ProxyStream> {
     Ok(ProxyStream::new(reader, writer, child))
 }
 
-async fn upstream(settings: &Settings) -> Result<WebSocketStream<UpstreamStream>> {
-    timeout(settings.timeout(), async {
+async fn upstream(
+    settings: &Settings,
+    websocket: &crate::config::WebSocketConfig,
+) -> Result<WebSocketStream<UpstreamStream>> {
+    timeout(Duration::from_millis(websocket.connect_timeout_ms), async {
         let stream: UpstreamStream = match settings.config.transport {
             Transport::Proxy => Box::new(proxy_stream(settings).await?),
             Transport::Socket => {
@@ -216,7 +299,7 @@ async fn upstream(settings: &Settings) -> Result<WebSocketStream<UpstreamStream>
             }
         };
         let (websocket, _) =
-            client_async_with_config("ws://localhost/", stream, Some(ws_config(settings))).await?;
+            client_async_with_config("ws://localhost/", stream, Some(ws_config(websocket))).await?;
         Ok::<_, anyhow::Error>(websocket)
     })
     .await
@@ -229,22 +312,64 @@ fn reject(status: StatusCode, reason: &str) -> ErrorResponse {
     response
 }
 
+fn reject_unauthorized() -> ErrorResponse {
+    let mut response = reject(
+        StatusCode::UNAUTHORIZED,
+        "WebSocket authentication required",
+    );
+    response
+        .headers_mut()
+        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+fn authorized(request: &Request, expected: Option<AuthToken>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let mut values = request.headers().get_all("authorization").iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let mut parts = value.split_ascii_whitespace();
+    let Some(scheme) = parts.next() else {
+        return false;
+    };
+    let Some(token) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+        return false;
+    }
+    expected.matches(token)
+}
+
 // Tungstenite's callback API fixes the error type to an HTTP response.
 #[allow(clippy::result_large_err)]
 async fn connection(
     stream: TcpStream,
     settings: Arc<Settings>,
     ready: Arc<AtomicBool>,
+    websocket: crate::config::WebSocketConfig,
+    auth_token: Option<AuthToken>,
     authority: String,
 ) -> Result<()> {
-    // Connect upstream before accepting the downstream handshake so an accepted
-    // connection always has a corresponding Codex session.
-    let upstream = upstream(&settings).await?;
+    // Authenticate before starting a proxy process. This keeps unauthorized
+    // clients from creating Codex sessions or causing daemon activity.
     let downstream = timeout(
-        settings.timeout(),
+        Duration::from_millis(websocket.connect_timeout_ms),
         accept_hdr_async_with_config(
             stream,
             move |request: &Request, response: Response| {
+                if !authorized(request, auth_token) {
+                    return Err(reject_unauthorized());
+                }
                 if !ready.load(Ordering::Acquire) {
                     return Err(reject(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -272,11 +397,12 @@ async fn connection(
                 }
                 Ok(response)
             },
-            Some(ws_config(&settings)),
+            Some(ws_config(&websocket)),
         ),
     )
     .await
     .context("WebSocket handshake timed out")??;
+    let upstream = upstream(&settings, &websocket).await?;
     let (mut upstream_write, mut upstream_read) = upstream.split();
     let (mut downstream_write, mut downstream_read) = downstream.split();
     // Independent pumps prevent a slow receiver from blocking reads in the
@@ -285,7 +411,7 @@ async fn connection(
         result = relay(&mut downstream_read, &mut upstream_write) => result,
         result = relay(&mut upstream_read, &mut downstream_write) => result,
     };
-    let _ = timeout(settings.timeout(), async {
+    let _ = timeout(Duration::from_millis(websocket.connect_timeout_ms), async {
         let _ = tokio::join!(upstream_write.close(), downstream_write.close());
     })
     .await;
@@ -317,11 +443,12 @@ where
 }
 
 async fn probe(settings: &Settings) -> Result<()> {
-    let mut ws = upstream(settings).await?;
+    let websocket = &settings.config.websocket;
+    let mut ws = upstream(settings, websocket).await?;
     // The successful opening handshake establishes readiness. Some Codex
     // proxies leave stdout open after a close frame, so connection cleanup
     // must not turn a reachable daemon into an unhealthy upstream.
-    let cleanup = timeout(settings.timeout(), async {
+    let cleanup = timeout(Duration::from_millis(websocket.connect_timeout_ms), async {
         ws.close(None).await?;
         // Allow a graceful close where supported, then drop/reap the proxy.
         let _ = ws.next().await;
@@ -389,6 +516,39 @@ async fn environment_worker(
         .context("environment cleanup worker panicked")?
 }
 
+struct Endpoint {
+    name: Option<String>,
+    config: crate::config::WebSocketConfig,
+    auth_token: Option<AuthToken>,
+    listener: Arc<TcpListener>,
+    address: SocketAddr,
+    capacity: Arc<Semaphore>,
+}
+
+async fn accept_endpoint(
+    index: usize,
+    listener: Arc<TcpListener>,
+) -> (usize, io::Result<(TcpStream, SocketAddr)>) {
+    (index, listener.accept().await)
+}
+
+fn named_status(endpoints: &[Endpoint], ready: bool) -> BTreeMap<String, EndpointStatus> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            endpoint.name.as_ref().map(|name| {
+                (
+                    name.clone(),
+                    EndpointStatus {
+                        url: format!("ws://{}/", endpoint.address),
+                        ready,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     private_dir(&settings.state_dir)?;
     let lock = OpenOptions::new()
@@ -405,21 +565,70 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("cannot clear previous stop request"),
     }
-    let listener = TcpListener::bind(SocketAddr::new(
-        settings.config.websocket.host,
-        settings.config.websocket.port,
-    ))
-    .await
-    .context("cannot bind WebSocket port (a fixed port is never silently changed)")?;
-    let address = listener.local_addr()?;
+    // Bind fixed ports before dynamic ports. This keeps a dynamic endpoint
+    // from consuming a fixed endpoint's port when configurations are changed
+    // concurrently with a running bridge.
+    let mut plans = Vec::with_capacity(1 + settings.config.websockets.len());
+    plans.push((None, settings.config.websocket.clone()));
+    plans.extend(
+        settings
+            .config
+            .websockets
+            .iter()
+            .map(|(name, config)| (Some(name.clone()), config.as_websocket())),
+    );
+    plans.sort_by_key(|(_, config)| config.port == 0);
+    // Resolve every inline/file token before binding any endpoint. A bad or
+    // unreadable token therefore cannot leave a partially started bridge.
+    let plans = plans
+        .into_iter()
+        .map(|(name, config)| {
+            let auth_token = load_auth_token(&config).with_context(|| {
+                format!(
+                    "load WebSocket authentication for {} endpoint",
+                    name.as_deref().unwrap_or("default")
+                )
+            })?;
+            Ok::<_, anyhow::Error>((name, config, auth_token))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut endpoints = Vec::with_capacity(plans.len());
+    for (name, config, auth_token) in plans {
+        let listener = TcpListener::bind(SocketAddr::new(config.host, config.port))
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot bind WebSocket {} port (a fixed port is never silently changed)",
+                    name.as_deref().unwrap_or("default")
+                )
+            })?;
+        let address = listener.local_addr()?;
+        endpoints.push(Endpoint {
+            name,
+            auth_token,
+            capacity: Arc::new(Semaphore::new(config.max_connections)),
+            config,
+            listener: Arc::new(listener),
+            address,
+        });
+    }
+    let default_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.is_none())
+        .context("default WebSocket endpoint was not bound")?;
+    let address = default_endpoint.address;
     let url = format!("ws://{address}/");
+    let named_urls = named_status(&endpoints, false);
     let ready = Arc::new(AtomicBool::new(false));
     let settings = Arc::new(settings);
     let mut tasks = JoinSet::new();
-    let capacity = Arc::new(Semaphore::new(settings.config.websocket.max_connections));
+    let mut accepts = futures_util::stream::FuturesUnordered::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        accepts.push(accept_endpoint(index, endpoint.listener.clone()));
+    }
     let mut timer = interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    write_status(&settings, &url, false)?;
+    write_status(&settings, &url, false, &named_urls)?;
     let (environment_tx, environment_rx) = watch::channel(false);
     let environment_task = tokio::spawn(environment_worker(
         settings.clone(),
@@ -479,18 +688,33 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
                         tasks.abort_all();
                     }
                     environment_tx.send_replace(is_ready);
-                    write_status(&settings, &url, is_ready)?;
+                    write_status(&settings, &url, is_ready, &named_status(&endpoints, is_ready))?;
                 },
-                accepted = listener.accept() => {
+                accepted = accepts.next() => {
+                    let Some((index, accepted)) = accepted else {
+                        bail!("all WebSocket listeners stopped accepting");
+                    };
+                    let endpoint = &endpoints[index];
+                    accepts.push(accept_endpoint(index, endpoint.listener.clone()));
                     let (stream, peer) = accepted.context("TCP accept failed")?;
-                    if !ready.load(Ordering::Acquire) { continue; }
-                    let Ok(permit) = capacity.clone().try_acquire_owned() else { continue; };
+                    let Ok(permit) = endpoint.capacity.clone().try_acquire_owned() else { continue; };
                     let settings = settings.clone();
                     let ready = ready.clone();
-                    let authority = address.to_string();
+                    let authority = endpoint.address.to_string();
+                    let websocket = endpoint.config.clone();
+                    let auth_token = endpoint.auth_token;
                     tasks.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = connection(stream, settings, ready, authority).await {
+                        if let Err(error) = connection(
+                            stream,
+                            settings,
+                            ready,
+                            websocket,
+                            auth_token,
+                            authority,
+                        )
+                        .await
+                        {
                             tracing::debug!(%peer, %error, "connection ended");
                         }
                     });
@@ -514,7 +738,7 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
         .await
         .context("environment task panicked")
         .and_then(|result| result);
-    let state_result = write_status(&settings, &url, false);
+    let state_result = write_status(&settings, &url, false, &named_status(&endpoints, false));
     result?;
     cleanup?;
     state_result?;
@@ -534,6 +758,14 @@ pub fn show_status(settings: &Settings) -> Result<()> {
     state["running"] = running.into();
     if !running {
         state["ready"] = false.into();
+        if let Some(websockets) = state
+            .get_mut("websockets")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for endpoint in websockets.values_mut() {
+                endpoint["ready"] = false.into();
+            }
+        }
     }
     println!("{}", serde_json::to_string_pretty(&state)?);
     if !running {

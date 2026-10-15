@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, Metadata, OpenOptions},
     io::{ErrorKind, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const EXAMPLE: &str = r#"# ~/.codex-app-server-bridge/config.toml
@@ -31,8 +32,26 @@ port = 0
 connect_timeout_ms = 3000
 max_connections = 64
 max_message_size = 67108864
+# Authentication is disabled by default. Set exactly one of these to require
+# Authorization: Bearer <token>. Token files are read once when the bridge starts.
+# auth_token = "replace-with-your-token"
+# auth_token_file = "~/.codex-app-server-bridge/websocket.token"
 # Opt in to automatically setting CODEX_APP_SERVER_WS_URL for the user.
 publish_codex_app_server_ws_url_environment = false
+
+# Additional WebSocket endpoints. Each name must be unique and must not
+# contain a dot or control character. Named endpoints cannot publish the
+# CODEX_APP_SERVER_WS_URL environment variable.
+#
+# [websockets.secondary]
+# host = "127.0.0.1"
+# port = 8765
+# connect_timeout_ms = 3000
+# max_connections = 64
+# max_message_size = 67108864
+# Authentication is configured independently for each endpoint; choose at most one.
+# auth_token = "replace-with-another-token"
+# auth_token_file = "~/.codex-app-server-bridge/secondary.token"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +67,8 @@ pub struct Config {
     pub windows_user_sid: Option<String>,
     pub poll_interval_ms: u64,
     pub websocket: WebSocketConfig,
+    #[serde(default)]
+    pub websockets: BTreeMap<String, NamedWebSocketConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,7 +79,43 @@ pub struct WebSocketConfig {
     pub connect_timeout_ms: u64,
     pub max_connections: usize,
     pub max_message_size: usize,
+    pub auth_token: Option<String>,
+    pub auth_token_file: Option<PathBuf>,
     pub publish_codex_app_server_ws_url_environment: bool,
+}
+
+/// Configuration for an additional named WebSocket endpoint.
+///
+/// Environment publication deliberately is not part of this type. This keeps
+/// `[websockets.<name>]` strict: attempting to configure
+/// `publish_codex_app_server_ws_url_environment` is rejected as an unknown
+/// field instead of silently doing something different from the default
+/// endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamedWebSocketConfig {
+    pub host: IpAddr,
+    pub port: u16,
+    pub connect_timeout_ms: u64,
+    pub max_connections: usize,
+    pub max_message_size: usize,
+    pub auth_token: Option<String>,
+    pub auth_token_file: Option<PathBuf>,
+}
+
+impl NamedWebSocketConfig {
+    pub fn as_websocket(&self) -> WebSocketConfig {
+        WebSocketConfig {
+            host: self.host,
+            port: self.port,
+            connect_timeout_ms: self.connect_timeout_ms,
+            max_connections: self.max_connections,
+            max_message_size: self.max_message_size,
+            auth_token: self.auth_token.clone(),
+            auth_token_file: self.auth_token_file.clone(),
+            publish_codex_app_server_ws_url_environment: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,6 +139,7 @@ impl Default for Config {
             windows_user_sid: None,
             poll_interval_ms: 2000,
             websocket: WebSocketConfig::default(),
+            websockets: BTreeMap::new(),
         }
     }
 }
@@ -94,7 +152,24 @@ impl Default for WebSocketConfig {
             connect_timeout_ms: 3000,
             max_connections: 64,
             max_message_size: 64 * 1024 * 1024,
+            auth_token: None,
+            auth_token_file: None,
             publish_codex_app_server_ws_url_environment: false,
+        }
+    }
+}
+
+impl Default for NamedWebSocketConfig {
+    fn default() -> Self {
+        let default = WebSocketConfig::default();
+        Self {
+            host: default.host,
+            port: default.port,
+            connect_timeout_ms: default.connect_timeout_ms,
+            max_connections: default.max_connections,
+            max_message_size: default.max_message_size,
+            auth_token: default.auth_token,
+            auth_token_file: default.auth_token_file,
         }
     }
 }
@@ -201,14 +276,41 @@ impl Settings {
         if let Some(port) = port {
             config.websocket.port = port;
         }
-        if !config.websocket.host.is_loopback() {
-            bail!("websocket.host must be a loopback address (127.0.0.1 or ::1)");
+        validate_websocket("websocket", &config.websocket)?;
+        if let Some(path) = &config.websocket.auth_token_file {
+            config.websocket.auth_token_file = Some(absolute(path, &user_home)?);
         }
-        if config.poll_interval_ms < 100 || config.websocket.connect_timeout_ms < 100 {
-            bail!("poll_interval_ms and websocket.connect_timeout_ms must be at least 100");
+        if config.poll_interval_ms < 100 {
+            bail!("poll_interval_ms must be at least 100");
         }
-        if config.websocket.max_connections == 0 || config.websocket.max_message_size == 0 {
-            bail!("websocket.max_connections and websocket.max_message_size must be positive");
+        let mut fixed_endpoints = BTreeMap::new();
+        if config.websocket.port != 0 {
+            fixed_endpoints.insert((config.websocket.host, config.websocket.port), "websocket");
+        }
+        for (name, named) in &mut config.websockets {
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|character| character == '.' || character.is_control())
+            {
+                bail!(
+                    "websockets names must be nonempty and must not contain dots or control characters: {name:?}"
+                );
+            }
+            validate_websocket(&format!("websockets.{name}"), &named.as_websocket())?;
+            if let Some(path) = &named.auth_token_file {
+                named.auth_token_file = Some(absolute(path, &user_home)?);
+            }
+            if named.port != 0
+                && let Some(previous) =
+                    fixed_endpoints.insert((named.host, named.port), name.as_str())
+            {
+                bail!(
+                    "websocket endpoints {previous:?} and {name:?} use the same fixed host and port {}:{}",
+                    named.host,
+                    named.port
+                );
+            }
         }
         if let Some(sid) = &config.windows_user_sid
             && (!sid.starts_with("S-1-")
@@ -230,10 +332,46 @@ impl Settings {
             state_dir,
         })
     }
+}
 
-    pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.config.websocket.connect_timeout_ms)
+fn validate_websocket(name: &str, websocket: &WebSocketConfig) -> Result<()> {
+    if !websocket.host.is_loopback() {
+        bail!("{name}.host must be a loopback address (127.0.0.1 or ::1)");
     }
+    if websocket.connect_timeout_ms < 100 {
+        bail!("{name}.connect_timeout_ms must be at least 100");
+    }
+    if websocket.max_connections == 0 || websocket.max_message_size == 0 {
+        bail!("{name}.max_connections and {name}.max_message_size must be positive");
+    }
+    if websocket.auth_token.is_some() && websocket.auth_token_file.is_some() {
+        bail!("{name}.auth_token and {name}.auth_token_file are mutually exclusive");
+    }
+    if let Some(token) = &websocket.auth_token {
+        validate_auth_token(token).with_context(|| format!("invalid {name}.auth_token"))?;
+    }
+    if let Some(path) = &websocket.auth_token_file
+        && path.as_os_str().is_empty()
+    {
+        bail!("{name}.auth_token_file must be a nonempty path");
+    }
+    Ok(())
+}
+
+/// Accept the RFC 6750 `b64token` syntax without placing secrets in errors.
+/// The same validation applies to inline tokens and file contents at startup.
+pub fn validate_auth_token(token: &str) -> Result<()> {
+    let unpadded = token.trim_end_matches('=');
+    if unpadded.is_empty()
+        || !unpadded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+    {
+        bail!(
+            "authentication token must contain nonempty Bearer token ASCII characters with optional trailing '=' padding"
+        );
+    }
+    Ok(())
 }
 
 const CONFIG_DIRECTORY: &str = ".codex-app-server-bridge";

@@ -4,7 +4,7 @@
 
 使用 Rust 将 Codex app-server 暴露为 `ws://127.0.0.1:<端口>/`。默认情况下，每个 WebSocket 客户端对应一个 `codex app-server proxy` 子进程，桥接通过 WebSocket 转发 proxy 的 STDIO 字节流，因此不依赖 Codex 的 control socket 路径。也可以选择 `socket` 直连传输以兼容旧方式。可选开启自动设置用户环境变量 `CODEX_APP_SERVER_WS_URL`，默认关闭。
 
-支持 Windows、macOS 和 Linux；支持固定端口、动态端口，以及后台服务或登录启动。可选开启在 Codex app-server daemon 未运行时自动启动，默认关闭。默认 proxy 模式下由 Codex 负责发现和管理 control endpoint。
+支持 Windows、macOS 和 Linux；支持多个 WebSocket 监听、固定端口、动态端口，以及后台服务或登录启动。可选开启在 Codex app-server daemon 未运行时自动启动，默认关闭。默认 proxy 模式下由 Codex 负责发现和管理 control endpoint。
 
 ## 下载与自动发布
 
@@ -129,9 +129,30 @@ connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
 max_connections = 64
 max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
 publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 true 自动设置用户环境变量
+# 可选鉴权；两个字段都省略时，客户端无需提供 token。
+# auth_token_file 与 auth_token 只能选一个。
+# auth_token_file = "~/.codex-app-server-bridge/websocket.token"
+# auth_token = "replace-with-a-long-random-token"
 ```
 
-WebSocket 配置统一放在 `[websocket]` 表中。升级前，如果已有配置在顶层使用 `host`、`port`、`connect_timeout_ms`、`max_connections`、`max_message_size` 或 `publish_codex_app_server_ws_url_environment`，请先将这些字段移入 `[websocket]`；新版本会拒绝旧的顶层字段，不会自动迁移。`poll_interval_ms`、传输方式、daemon 和路径配置仍放在顶层，写在 `[websocket]` 之前。
+默认 WebSocket 监听使用 `[websocket]` 表。升级前，如果已有配置在顶层使用 `host`、`port`、`connect_timeout_ms`、`max_connections`、`max_message_size` 或 `publish_codex_app_server_ws_url_environment`，请先将这些字段移入 `[websocket]`；新版本会拒绝旧的顶层字段，不会自动迁移。`poll_interval_ms`、传输方式、daemon 和路径配置仍放在顶层，写在 `[websocket]` 之前。
+
+使用 `[websockets.<name>]` 添加具名监听。名称不能为空，也不能包含点号或控制字符：
+
+```toml
+[websockets.tools]
+host = "127.0.0.1"
+port = 63101
+connect_timeout_ms = 3000
+max_connections = 32
+max_message_size = 67108864
+
+[websockets.ipv6]
+host = "::1"
+port = 0
+```
+
+所有监听共用顶层的 Codex 传输方式、daemon 和路径配置。每个监听分别设置端口、连接数上限、消息大小上限、连接超时及可选鉴权；省略字段时使用内置默认值，不继承 `[websocket]`，鉴权配置也不继承。端口为 `0` 时，各监听独立选择动态端口。具名监听不支持 `publish_codex_app_server_ws_url_environment`，即使设为 `false` 也会报错；只有默认 `[websocket]` 可以发布 `CODEX_APP_SERVER_WS_URL`。
 
 配置优先级：
 
@@ -143,7 +164,7 @@ WebSocket 配置统一放在 `[websocket]` 表中。升级前，如果已有配�
 | 上游传输 | TOML `transport` → `proxy`（通过 Codex `app-server proxy` 的 STDIO） |
 | socket 路径 | 仅 `transport = "socket"` 时使用；TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex 执行文件 | TOML `codex_path` → 从 `PATH` 和常见安装位置自动检测 |
-| 端口 | `--port` → TOML `websocket.port` → `0` |
+| 默认监听端口 | `--port` → TOML `websocket.port` → `0`；具名监听使用各自的 `websockets.<name>.port` |
 
 TOML 中的 `user_home` 在读取配置后生效，不会改变已经选定的配置文件路径。路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。之后修改服务使用的路径时，请使用绝对路径或 `~`，避免依赖服务管理器的工作目录。TOML 未知字段会报错，避免拼写错误被忽略。
 
@@ -154,6 +175,10 @@ codex-app-server-bridge config list
 codex-app-server-bridge config get websocket.port
 codex-app-server-bridge config set websocket.port 8765
 codex-app-server-bridge config set websocket.publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config set websockets.tools.port 63101
+codex-app-server-bridge config get websockets.tools.port
+codex-app-server-bridge config set websockets.tools.auth_token_file '~/.codex-app-server-bridge/tools.token'
+codex-app-server-bridge config get websockets.tools.auth_token_file
 codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
@@ -172,7 +197,7 @@ codex-app-server-bridge --config /path/to/bridge.toml config set websocket.port 
 
 `config set KEY VALUE` 接受与字段类型匹配的值。数字和布尔值使用 TOML 语法；路径、`websocket.host` 等字符串字段也可直接传入裸字符串，如上方示例。没有用于删除字段的特殊 unset 或 `null` 语法。该命令会创建缺失的配置文件，包括显式 `--config` 指定的文件；保留其他字段和注释，校验完整配置后再写入，并以 JSON 输出保存后的值，不会将运行时覆盖值写回文件。
 
-配置键支持使用点分路径导航：`[websocket]` 内的字段使用 `websocket.port` 等路径，顶层字段使用 `transport`、`socket_path` 等名称。未知字段或子键会被拒绝。
+配置键支持使用点分路径导航：`[websocket]` 内的字段使用 `websocket.port` 等路径，具名监听使用 `websockets.tools.port` 等路径，顶层字段使用 `transport`、`socket_path` 等名称。设置新名称下的字段会创建对应监听。未知字段或子键会被拒绝。
 
 服务直接读取 `config list`、`config get`、`config set` 所选的同一份配置：默认 `~/.codex-app-server-bridge/config.toml`，或安装时通过 `--config` 指定的文件。修改配置不会使运行中的实例自动重新加载。前台进程需要重启；已安装服务执行 `service restart` 即可，操作系统重启服务或重新开机也会应用修改。启动已停止的服务同样会重新读取配置。
 
@@ -186,6 +211,36 @@ codex-app-server-bridge --config /path/to/bridge.toml service restart --scope us
 ```
 
 修改 `user_home` 或 `state_dir` 会影响安装位置或运行状态目录。应先停止服务，再修改这些字段，然后使用目标主目录和配置文件重新执行 `service install`；不要依靠简单重启迁移安装位置。
+
+## WebSocket 监听鉴权
+
+`[websocket]` 和 `[websockets.<name>]` 都支持可选的 `auth_token` 或 `auth_token_file`。默认省略两个字段，不启用鉴权；同一监听的两个字段互斥。具名监听不继承默认监听的 token。
+
+推荐使用 `auth_token_file`，将 token 单独存放在 TOML 配置之外。文件只包含 token，可以带一个行尾换行，运行桥接的账号需要有读取权限。文件总大小（含换行）不能超过 64 KiB。例如，默认监听可以不设 token 并发布环境变量，同时让额外端口使用独立 token：
+
+```toml
+[websocket]
+port = 63100
+publish_codex_app_server_ws_url_environment = true
+
+[websockets.tools]
+port = 63101
+auth_token_file = "~/.codex-app-server-bridge/tools.token"
+# 也可以删去 auth_token_file，改为：
+# auth_token = "replace-with-a-long-random-token"
+```
+
+桥接在启动时读取一次 token 文件，并移除末尾的 CR/LF 换行字符。文件无法读取、token 为空或格式无效时，启动会失败。token 遵循 RFC 6750 的 Bearer-token 格式：一个或多个 ASCII 字母、数字或 `-._~+/` 字符，末尾可以带 `=`，不允许内嵌空白。修改文件后需要重启桥接。token 文件路径遵循其他配置路径相同的 `~` 展开和相对路径规则。两个字段都支持 `config get` 和 `config set`，例如 `config set websockets.tools.auth_token_file '~/.codex-app-server-bridge/tools.token'`。直接配置的 `auth_token` 会显示在 `config list` 和 `config get` 输出中，使用 token 文件可避免配置输出包含 token 原文。
+
+让原生 WebSocket 客户端连接 `ws://127.0.0.1:63101/`，并在 HTTP 握手时携带以下请求头，将示例值换成文件内的 token：
+
+```http
+Authorization: Bearer replace-with-a-long-random-token
+```
+
+这里使用 [Codex app-server 协议](https://learn.chatgpt.com/docs/app-server#protocol) 文档描述的 `Authorization: Bearer <token>` 握手请求头。桥接在接受 WebSocket 连接之前校验配置的静态 token，发生在任何 `initialize` 消息之前。缺少凭据或凭据错误时返回 HTTP `401 Unauthorized`。鉴权只发生在本地桥接，token 不转发给 Codex。当前实现校验静态 capability token，不验证签名 JWT。
+
+token 不会写入 WebSocket URL、运行状态或发布的环境变量。`CODEX_APP_SERVER_WS_URL` 只提供 URL；连接需要鉴权的监听时，客户端还必须支持单独设置 Bearer 请求头。如果客户端只接受该环境变量，可保留默认监听不启用鉴权。所有监听仍只允许 loopback 地址。
 
 ## 自动启动 Codex daemon
 
@@ -203,7 +258,7 @@ Windows 自动启动 daemon 仅支持普通、未提升权限的用户进程：�
 
 ## 环境变量如何生效
 
-自动设置环境变量**默认关闭**，省略 `websocket.publish_codex_app_server_ws_url_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
+自动设置环境变量**默认关闭**，省略 `websocket.publish_codex_app_server_ws_url_environment` 也保持关闭。只有默认 `[websocket]` 可以发布其 URL，具名 `[websockets.<name>]` 不发布环境变量。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
 
 需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge/config.toml` 中开启：
 
@@ -250,6 +305,8 @@ Windows 原生服务运行在 Session 0，其环境变更广播无法刷新另�
 
 `service install` 会注册并立即启动；重复安装会更新注册并重新启动。启动注册直接指向所选配置文件。安装会将必要的用户身份、Codex 目录、命令行覆盖值及解析后的 Codex 执行文件路径保存到同一份配置中，保留注释及无关设置。proxy 模式无论是否开启 daemon 自动启动，都会解析并保存 `codex_path`，以便在服务的最小环境中启动 Codex。已配置的路径会转为绝对路径以供服务使用；未指定的 `socket_path` 和 `state_dir` 继续按默认规则派生，不会固化为显式值。端口、daemon 选项等普通配置修改后，执行 `service restart` 即可生效，无需重新安装。不同启动方式共用同一状态目录的实例锁，不应同时安装用户和系统两种启动方式。
 
+选定的注册方式还会保存到 `~/.codex-app-server-bridge/service.toml`，其中记录 `type`、`autostart`、身份、程序、配置文件、Codex 主目录和状态目录。省略后端参数执行 `service status`、`start`、`stop`、`restart`、`uninstall` 或 `update` 时会复用该文件；桥接运行配置仍保存在 `config.toml`。`--type` 可选 `user`、`system`、`scheduled-task`、`launch-agent`、`launch-daemon`，`--autostart` 可选 `login` 或 `startup`。
+
 Linux 生成的 systemd unit 停止时仅终止桥接进程，因此停止或重启桥接服务会保留独立运行的 Codex daemon。
 
 ### Windows：当前用户登录启动
@@ -271,11 +328,11 @@ Run 启动命令超过 260 个 UTF-16 字符时安装会明确失败；请使用
 
 ### Windows：原生系统服务
 
-在**目标用户本人提升权限的管理员 PowerShell**中执行，避免使用另一个管理员账户安装。安装会记录当前用户 SID；服务由 SCM 以 `LocalSystem` 运行，环境变量写入记录的用户，而不是 LocalSystem 自己的用户环境。
+在**目标用户本人提升权限的管理员 PowerShell**中执行，避免使用另一个管理员账户安装。服务注册为当前用户身份运行；Windows 可能要求该账户的登录凭据。此方式在系统启动时运行。
 
 ```powershell
 $bridge = 'C:\Tools\codex-app-server-bridge.exe'
-& $bridge --user-home 'C:\Users\alice' --codex-home 'C:\Users\alice\.codex' service install --scope system
+& $bridge --user-home 'C:\Users\alice' --codex-home 'C:\Users\alice\.codex' service install --type system --autostart startup
 $bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service status --scope system
 & $bridge service stop --scope system
@@ -284,7 +341,20 @@ $bridge = 'C:\Users\alice\.codex-app-server-bridge\codex-app-server-bridge.exe'
 & $bridge service uninstall --scope system
 ```
 
-将示例用户名和路径替换为真实值。服务名为 `codex-app-server-bridge`，配置为延迟自动启动，异常退出后由 SCM 尝试重新启动。Windows 的 `--username` 不适用。
+将示例路径替换为真实值。服务名为 `codex-app-server-bridge`，异常退出后由 SCM 尝试重新启动。Windows 的 `--username` 不适用。
+
+### Windows：计划任务
+
+需要按当前用户身份注册、又不想安装 SCM 系统服务时，可使用计划任务；它支持登录和系统启动两种触发方式：
+
+```powershell
+& $bridge service install --type scheduled-task --autostart login
+# 或：--autostart startup
+```
+
+启动触发器使用无密码批处理令牌；如果 Windows 拒绝注册，请为当前账户授予“作为批处理作业登录”权限，或改用登录触发器。
+
+启动触发器使用当前账户的无密码批处理令牌。如果 Windows 拒绝该任务，请为账户授予“作为批处理作业登录”权限，或改用登录时启动。
 
 ### Linux：systemd 用户服务
 
@@ -345,7 +415,7 @@ codex-app-server-bridge service install --scope user
 ```sh
 sudo ./target/release/codex-app-server-bridge \
   --user-home /Users/alice --codex-home /Users/alice/.codex \
-  service install --scope system --username alice
+  service install --type launch-daemon --autostart startup
 
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service status --scope system --username alice
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service stop --scope system --username alice
@@ -354,7 +424,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /Users/alice --codex-home /Users/alice/.codex service uninstall --scope system --username alice
 ```
 
-配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 按指定用户身份运行。用户目录或 Codex 主目录在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
+配置文件为 `/Library/LaunchDaemons/io.codex.app-server-bridge.plist`，通过 `UserName` 默认按当前用户身份运行。用户目录或 Codex 主目录在登录前尚不可用时，桥接的实际可用时间仍取决于这些资源；LaunchDaemon 不能提前解锁加密的用户数据。
 
 ### 卸载与日志
 
@@ -368,7 +438,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 | Linux 系统服务 | `sudo journalctl -u codex-app-server-bridge -f` |
 | macOS launchd | `<state_dir>/service.stdout.log` 和 `service.stderr.log` |
 
-`status` 检查实例锁并输出运行状态（包括传输方式）；`service status` 查询操作系统启动项或服务状态。服务处于运行状态并不意味着 Codex 上游已经就绪，仍需查看 `status` 的 `ready` 字段。
+`status` 检查实例锁并输出运行状态（包括传输方式）。顶层 `url` 和 `ready` 对应默认监听，`websockets.<name>.url` 和 `websockets.<name>.ready` 对应各具名监听；URL 中包含实际分配的端口，包括动态端口。`service status` 查询操作系统启动项或服务状态。服务处于运行状态并不意味着 Codex 上游已经就绪，仍需查看 `status` 中对应监听的 `ready` 字段。
 
 ## 协议与访问范围
 
@@ -378,7 +448,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 
 只监听 loopback 地址，只接受根路径 `/`，拒绝查询参数和带 `Origin` 的握手；`Host` 必须与发布的 URL 一致。不会转发 `/daemon/shutdown` 等其他路径。浏览器页面连接会被拒绝，应使用原生 WebSocket 客户端。
 
-桥接没有额外的令牌认证。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对 Codex app-server 通过 proxy 或直连端点暴露的 WebSocket 协议，其他版本若更改握手或协议，需要重新验证。
+每个监听都可以启用上文的可选 [Bearer token 鉴权](#websocket-监听鉴权)。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对 Codex app-server 通过 proxy 或直连端点暴露的 WebSocket 协议，其他版本若更改握手或协议，需要重新验证。
 
 ## 许可证
 

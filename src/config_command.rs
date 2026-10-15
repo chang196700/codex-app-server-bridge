@@ -1,4 +1,4 @@
-use crate::config::{self, Config, Settings};
+use crate::config::{self, Config, NamedWebSocketConfig, Settings};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde_json::Value as JsonValue;
@@ -18,6 +18,7 @@ pub enum Action {
 pub fn run(action: &Action, config_path: Option<&Path>, user_home: Option<&Path>) -> Result<()> {
     let path = config::resolve_config_path(config_path, user_home)?;
     let defaults = serde_json::to_value(Config::default())?;
+    let named_websocket_defaults = serde_json::to_value(NamedWebSocketConfig::default())?;
     match action {
         Action::List => {
             let document = read_document(&path, config_path.is_none())?;
@@ -26,7 +27,7 @@ pub fn run(action: &Action, config_path: Option<&Path>, user_home: Option<&Path>
         }
         Action::Get { key } => {
             let parts = key_parts(key)?;
-            schema_value(&defaults, &parts)?;
+            key_schema(&defaults, &named_websocket_defaults, &parts)?;
             let document = read_document(&path, config_path.is_none())?;
             let configured = serde_json::to_value(parse_config(&document, &path)?)?;
             let value = schema_value(&configured, &parts)?;
@@ -34,7 +35,7 @@ pub fn run(action: &Action, config_path: Option<&Path>, user_home: Option<&Path>
         }
         Action::Set { key, value } => {
             let parts = key_parts(key)?;
-            let schema = schema_value(&defaults, &parts)?;
+            let schema = key_schema(&defaults, &named_websocket_defaults, &parts)?;
             let replacement = parse_value(value, schema)?;
             let home = config::home_directory(user_home)?;
             let _lock = config::lock_configuration(&path, &home)?;
@@ -90,6 +91,16 @@ pub fn prepare_service(
     if let Some(port) = port {
         set_item(table, &["websocket", "port"], Value::from(i64::from(port)))?;
     }
+    // Service managers can start in a different working directory. Preserve
+    // the token files selected at installation for every listener.
+    if let Some(path) = &settings.config.websocket.auth_token_file {
+        set_path_key(table, &["websocket", "auth_token_file"], path)?;
+    }
+    for (name, websocket) in &settings.config.websockets {
+        if let Some(path) = &websocket.auth_token_file {
+            set_path_key(table, &["websockets", name, "auth_token_file"], path)?;
+        }
+    }
     if let Some(path) = settings.config.codex_path.as_deref() {
         set_path(table, "codex_path", path)?;
     } else if let Some(path) = detected_codex_path {
@@ -119,10 +130,14 @@ pub fn prepare_service(
 }
 
 fn set_path(table: &mut Table, name: &str, path: &Path) -> Result<()> {
+    set_path_key(table, &[name], path)
+}
+
+fn set_path_key(table: &mut Table, parts: &[&str], path: &Path) -> Result<()> {
     let path = path
         .to_str()
-        .with_context(|| format!("{name} must be a valid UTF-8 path"))?;
-    set_item(table, &[name], Value::from(path))
+        .with_context(|| format!("{} must be a valid UTF-8 path", parts.join(".")))?;
+    set_item(table, parts, Value::from(path))
 }
 
 fn read_document(path: &Path, allow_missing: bool) -> Result<DocumentMut> {
@@ -157,6 +172,26 @@ fn schema_value<'a>(schema: &'a JsonValue, parts: &[&str]) -> Result<&'a JsonVal
             .with_context(|| format!("unknown configuration key {:?}; only keys defined by the current schema are accepted", parts.join(".")))?;
     }
     Ok(value)
+}
+
+fn key_schema<'a>(
+    defaults: &'a JsonValue,
+    named_websocket_defaults: &'a JsonValue,
+    parts: &[&str],
+) -> Result<&'a JsonValue> {
+    if parts.first() == Some(&"websockets") && parts.len() >= 2 {
+        // The endpoint name is user-defined; every option below it still has
+        // to belong to the named-endpoint schema. In particular, publication
+        // is only available under the singular default `websocket` table.
+        schema_value(named_websocket_defaults, &parts[2..]).with_context(|| {
+            format!(
+                "invalid named WebSocket configuration key {:?}",
+                parts.join(".")
+            )
+        })
+    } else {
+        schema_value(defaults, parts)
+    }
 }
 
 fn parse_value(input: &str, schema: &JsonValue) -> Result<Value> {
@@ -205,7 +240,7 @@ fn set_item(table: &mut dyn TableLike, parts: &[&str], mut value: Value) -> Resu
     } else {
         if !table.contains_key(name) {
             // The complete key has already been checked against Config's
-            // schema, so this can only create an explicitly defined table.
+            // schema, including user-defined names under `websockets`.
             table.insert(name, Item::Table(Table::new()));
         }
         let nested = table
