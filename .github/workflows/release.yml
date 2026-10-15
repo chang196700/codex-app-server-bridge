@@ -77,12 +77,14 @@ jobs:
         with:
           name: prepared-source
           path: ${{ runner.temp }}/prepared-source
+      - name: Preserve the current release driver
+        run: cp .github/scripts/release.py "$RUNNER_TEMP/release-driver.py"
       - name: Restore the built release commit
         env:
           PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
           RELEASE_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
-        run: python3 .github/scripts/release.py restore
+        run: python3 "$RUNNER_TEMP/release-driver.py" restore
       - name: Install release-plz
         run: bash .github/scripts/install-release-plz.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -99,4 +101,4 @@ jobs:
           RELEASE_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
           PREPARED_SOURCE: ${{ runner.temp }}/prepared-source
           RELEASE_ASSETS: ${{ runner.temp }}/release-assets
-        run: python3 .github/scripts/release.py publish
+        run: python3 "$RUNNER_TEMP/release-driver.py" publish
