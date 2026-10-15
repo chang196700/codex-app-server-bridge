@@ -19,19 +19,20 @@ transport = "proxy"
 auto_start_codex_app_server_daemon = false
 # Optional Codex executable; otherwise discover it from PATH/common install locations.
 # codex_path = "/absolute/path/to/codex"
+poll_interval_ms = 2000
+# Runtime state and shell environment exports live here.
+# state_dir = "~/.local/state/codex-app-server-bridge"
 
+[websocket]
 # Only loopback addresses are accepted. Use an SSH tunnel for remote access.
 host = "127.0.0.1"
 # 0 = choose an available port; use e.g. 8765 for a fixed port.
 port = 0
-poll_interval_ms = 2000
 connect_timeout_ms = 3000
 max_connections = 64
 max_message_size = 67108864
 # Opt in to automatically setting CODEX_APP_SERVER_WS_URL for the user.
 publish_codex_app_server_ws_url_environment = false
-# Runtime state and shell environment exports live here.
-# state_dir = "~/.local/state/codex-app-server-bridge"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,26 +46,27 @@ pub struct Config {
     pub user_home: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
     pub windows_user_sid: Option<String>,
+    pub poll_interval_ms: u64,
+    pub websocket: WebSocketConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSocketConfig {
     pub host: IpAddr,
     pub port: u16,
-    pub poll_interval_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_connections: usize,
     pub max_message_size: usize,
     pub publish_codex_app_server_ws_url_environment: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
+    #[default]
     Proxy,
     Socket,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Self::Proxy
-    }
 }
 
 impl Default for Config {
@@ -78,9 +80,17 @@ impl Default for Config {
             user_home: None,
             state_dir: None,
             windows_user_sid: None,
+            poll_interval_ms: 2000,
+            websocket: WebSocketConfig::default(),
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
             host: IpAddr::from([127, 0, 0, 1]),
             port: 0,
-            poll_interval_ms: 2000,
             connect_timeout_ms: 3000,
             max_connections: 64,
             max_message_size: 64 * 1024 * 1024,
@@ -189,16 +199,16 @@ impl Settings {
             bail!("state_dir must be a dedicated directory, not a home directory or its ancestor");
         }
         if let Some(port) = port {
-            config.port = port;
+            config.websocket.port = port;
         }
-        if !config.host.is_loopback() {
-            bail!("host must be a loopback address (127.0.0.1 or ::1)");
+        if !config.websocket.host.is_loopback() {
+            bail!("websocket.host must be a loopback address (127.0.0.1 or ::1)");
         }
-        if config.poll_interval_ms < 100 || config.connect_timeout_ms < 100 {
-            bail!("poll_interval_ms and connect_timeout_ms must be at least 100");
+        if config.poll_interval_ms < 100 || config.websocket.connect_timeout_ms < 100 {
+            bail!("poll_interval_ms and websocket.connect_timeout_ms must be at least 100");
         }
-        if config.max_connections == 0 || config.max_message_size == 0 {
-            bail!("connection and message limits must be positive");
+        if config.websocket.max_connections == 0 || config.websocket.max_message_size == 0 {
+            bail!("websocket.max_connections and websocket.max_message_size must be positive");
         }
         if let Some(sid) = &config.windows_user_sid
             && (!sid.starts_with("S-1-")
@@ -222,7 +232,7 @@ impl Settings {
     }
 
     pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.config.connect_timeout_ms)
+        Duration::from_millis(self.config.websocket.connect_timeout_ms)
     }
 }
 

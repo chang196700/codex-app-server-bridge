@@ -8,7 +8,7 @@
 
 ## 下载与自动发布
 
-从 [GitHub Releases](https://github.com/chang196700/codex-app-server-bridge/releases) 下载适合操作系统与架构的压缩包。每个 Release 附带 `SHA256SUMS`，每个压缩包内包含程序、中英文 README 和构建信息。
+从 [GitHub Releases](https://github.com/chang196700/codex-app-server-bridge/releases) 下载适合操作系统与架构的压缩包。每个 Release 附带 `SHA256SUMS`，每个压缩包内包含程序、中英文 README、`LICENSE-MIT`、`LICENSE-APACHE` 和构建信息。
 
 | 平台 | 架构 | 压缩格式 |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ sudo /home/alice/.codex-app-server-bridge/codex-app-server-bridge \
 
 ## 构建与运行
 
-安装 Rust / rustup 和当前平台的 Rust 原生构建工具。工具链版本由仓库中的 `rust-toolchain.toml` 确定。
+安装 Rust / rustup 和当前平台的 Rust 原生构建工具。仓库中的 `rust-toolchain.toml` 固定使用当前最新稳定版 Rust 1.99.0，CI 原生构建也使用同一版本。
 
 ```sh
 cargo build --release --locked
@@ -117,17 +117,21 @@ auto_start_codex_app_server_daemon = false  # daemon 未运行时自动启动，
 # 可选；省略时从 PATH 和常见安装位置自动检测 Codex
 # codex_path = "/absolute/path/to/codex"
 
+poll_interval_ms = 2000         # 上游健康检查间隔，至少 100 毫秒
+
+# 必须使用本程序专用的状态目录
+# state_dir = "~/.local/state/codex-app-server-bridge"
+
+[websocket]
 host = "127.0.0.1"             # 也可使用 ::1；只接受 loopback 地址
 port = 0                       # 0 为动态端口；例如 8765 为固定端口
-poll_interval_ms = 2000         # 上游健康检查间隔，至少 100 毫秒
 connect_timeout_ms = 3000       # 连接和握手超时，至少 100 毫秒
 max_connections = 64
 max_message_size = 67108864     # 本桥接的消息/帧上限；仍受 Codex 上游限制
 publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 true 自动设置用户环境变量
-
-# 必须使用本程序专用的状态目录
-# state_dir = "~/.local/state/codex-app-server-bridge"
 ```
+
+WebSocket 配置统一放在 `[websocket]` 表中。升级前，如果已有配置在顶层使用 `host`、`port`、`connect_timeout_ms`、`max_connections`、`max_message_size` 或 `publish_codex_app_server_ws_url_environment`，请先将这些字段移入 `[websocket]`；新版本会拒绝旧的顶层字段，不会自动迁移。`poll_interval_ms`、传输方式、daemon 和路径配置仍放在顶层，写在 `[websocket]` 之前。
 
 配置优先级：
 
@@ -139,7 +143,7 @@ publish_codex_app_server_ws_url_environment = false  # 默认关闭；设为 tru
 | 上游传输 | TOML `transport` → `proxy`（通过 Codex `app-server proxy` 的 STDIO） |
 | socket 路径 | 仅 `transport = "socket"` 时使用；TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex 执行文件 | TOML `codex_path` → 从 `PATH` 和常见安装位置自动检测 |
-| 端口 | `--port` → TOML `port` → `0` |
+| 端口 | `--port` → TOML `websocket.port` → `0` |
 
 TOML 中的 `user_home` 在读取配置后生效，不会改变已经选定的配置文件路径。路径开头的 `~` 会展开为所选用户主目录；其他相对路径相对于启动命令时的工作目录。安装服务时会将路径固定为绝对路径。之后修改服务使用的路径时，请使用绝对路径或 `~`，避免依赖服务管理器的工作目录。TOML 未知字段会报错，避免拼写错误被忽略。
 
@@ -147,9 +151,9 @@ TOML 中的 `user_home` 在读取配置后生效，不会改变已经选定的�
 
 ```sh
 codex-app-server-bridge config list
-codex-app-server-bridge config get port
-codex-app-server-bridge config set port 8765
-codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config get websocket.port
+codex-app-server-bridge config set websocket.port 8765
+codex-app-server-bridge config set websocket.publish_codex_app_server_ws_url_environment true
 codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
@@ -160,20 +164,20 @@ codex-app-server-bridge config set codex_path /absolute/path/to/codex
 codex-app-server-bridge config set auto_start_codex_app_server_daemon true
 
 # 查看或修改自定义配置文件
-codex-app-server-bridge --config /path/to/bridge.toml config get port
-codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
+codex-app-server-bridge --config /path/to/bridge.toml config get websocket.port
+codex-app-server-bridge --config /path/to/bridge.toml config set websocket.port 8765
 ```
 
 `config list` 输出配置文件与内置默认值合并后的 JSON 对象。`config get KEY` 仅以 JSON 输出指定字段的值：字符串带引号，未设置的可选字段为 `null`。这些命令显示配置值，不应用 `CODEX_HOME` 等运行时环境变量或 `--port` 等命令行覆盖。
 
-`config set KEY VALUE` 接受与字段类型匹配的值。数字和布尔值使用 TOML 语法；路径、`host` 等字符串字段也可直接传入裸字符串，如上方示例。没有用于删除字段的特殊 unset 或 `null` 语法。该命令会创建缺失的配置文件，包括显式 `--config` 指定的文件；保留其他字段和注释，校验完整配置后再写入，并以 JSON 输出保存后的值，不会将运行时覆盖值写回文件。
+`config set KEY VALUE` 接受与字段类型匹配的值。数字和布尔值使用 TOML 语法；路径、`websocket.host` 等字符串字段也可直接传入裸字符串，如上方示例。没有用于删除字段的特殊 unset 或 `null` 语法。该命令会创建缺失的配置文件，包括显式 `--config` 指定的文件；保留其他字段和注释，校验完整配置后再写入，并以 JSON 输出保存后的值，不会将运行时覆盖值写回文件。
 
-配置键支持使用点分路径导航。当前配置结构只有顶层字段，因此直接使用 `port`、`transport`、`socket_path` 等字段名；目前没有可通过点分路径访问的嵌套配置项。未知字段或子键会被拒绝。
+配置键支持使用点分路径导航：`[websocket]` 内的字段使用 `websocket.port` 等路径，顶层字段使用 `transport`、`socket_path` 等名称。未知字段或子键会被拒绝。
 
 服务直接读取 `config list`、`config get`、`config set` 所选的同一份配置：默认 `~/.codex-app-server-bridge/config.toml`，或安装时通过 `--config` 指定的文件。修改配置不会使运行中的实例自动重新加载。前台进程需要重启；已安装服务执行 `service restart` 即可，操作系统重启服务或重新开机也会应用修改。启动已停止的服务同样会重新读取配置。
 
 ```sh
-codex-app-server-bridge config set port 63100
+codex-app-server-bridge config set websocket.port 63100
 codex-app-server-bridge service restart --scope user
 
 # 配置命令与服务命令使用同一份自定义文件
@@ -199,15 +203,16 @@ Windows 自动启动 daemon 仅支持普通、未提升权限的用户进程：�
 
 ## 环境变量如何生效
 
-自动设置环境变量**默认关闭**，省略 `publish_codex_app_server_ws_url_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
-
-已有配置若使用旧名称 `publish_environment`，请将其替换为 `publish_codex_app_server_ws_url_environment`，然后重启桥接。
+自动设置环境变量**默认关闭**，省略 `websocket.publish_codex_app_server_ws_url_environment` 也保持关闭。此时 WebSocket 桥接正常运行，可通过 `status` 查看 URL，程序不会修改用户环境变量或 shell 配置。
 
 需要自动设置 `CODEX_APP_SERVER_WS_URL` 时，在 `~/.codex-app-server-bridge/config.toml` 中开启：
 
 ```toml
+[websocket]
 publish_codex_app_server_ws_url_environment = true
 ```
+
+如果已有 `[websocket]`，请在该表中添加或修改字段，不要重复声明表。
 
 修改后重启前台进程，已安装服务执行 `service restart`。要关闭已开启的发布功能，先停止原进程，让它清理自己发布的变量，再设为 `false` 并启动桥接或服务。
 
@@ -374,3 +379,7 @@ sudo /Users/alice/.codex-app-server-bridge/codex-app-server-bridge --user-home /
 只监听 loopback 地址，只接受根路径 `/`，拒绝查询参数和带 `Origin` 的握手；`Host` 必须与发布的 URL 一致。不会转发 `/daemon/shutdown` 等其他路径。浏览器页面连接会被拒绝，应使用原生 WebSocket 客户端。
 
 桥接没有额外的令牌认证。loopback 限制远程网络访问，不能隔离同机其他用户；应运行在可信的本机环境中，并按需要通过受控隧道访问。此实现针对 Codex app-server 通过 proxy 或直连端点暴露的 WebSocket 协议，其他版本若更改握手或协议，需要重新验证。
+
+## 许可证
+
+采用双许可证，可选择遵循 [MIT License](LICENSE-MIT) 或 [Apache License 2.0](LICENSE-APACHE)（`MIT OR Apache-2.0`）。

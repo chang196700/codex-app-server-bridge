@@ -1,6 +1,6 @@
 use crate::{
-    config::{Settings, Transport, private_dir},
     codex_path,
+    config::{Settings, Transport, private_dir},
     environment::Publisher,
     socket,
 };
@@ -65,8 +65,8 @@ fn write_status(settings: &Settings, url: &str, ready: bool) -> Result<()> {
 
 fn ws_config(settings: &Settings) -> WebSocketConfig {
     WebSocketConfig::default()
-        .max_message_size(Some(settings.config.max_message_size))
-        .max_frame_size(Some(settings.config.max_message_size))
+        .max_message_size(Some(settings.config.websocket.max_message_size))
+        .max_frame_size(Some(settings.config.websocket.max_message_size))
 }
 
 /// A bidirectional async stream backed by one Codex `app-server proxy`
@@ -157,10 +157,8 @@ impl Drop for ProxyStream {
 }
 
 async fn proxy_stream(settings: &Settings) -> Result<ProxyStream> {
-    let executable = codex_path::resolve(
-        settings.config.codex_path.as_deref(),
-        &settings.user_home,
-    )?;
+    let executable =
+        codex_path::resolve(settings.config.codex_path.as_deref(), &settings.user_home)?;
     let mut command = Command::new(&executable);
     // npm and version-manager launchers commonly require their containing
     // directory to remain in PATH. Services otherwise provide a minimal PATH.
@@ -338,7 +336,11 @@ async fn environment_worker(
     url: String,
     mut desired: watch::Receiver<bool>,
 ) -> Result<()> {
-    if !settings.config.publish_codex_app_server_ws_url_environment {
+    if !settings
+        .config
+        .websocket
+        .publish_codex_app_server_ws_url_environment
+    {
         return Ok(());
     }
     let mut publisher = Publisher::new(
@@ -394,15 +396,18 @@ pub async fn run(settings: Settings, mut shutdown: watch::Receiver<bool>) -> Res
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("cannot clear previous stop request"),
     }
-    let listener = TcpListener::bind(SocketAddr::new(settings.config.host, settings.config.port))
-        .await
-        .context("cannot bind WebSocket port (a fixed port is never silently changed)")?;
+    let listener = TcpListener::bind(SocketAddr::new(
+        settings.config.websocket.host,
+        settings.config.websocket.port,
+    ))
+    .await
+    .context("cannot bind WebSocket port (a fixed port is never silently changed)")?;
     let address = listener.local_addr()?;
     let url = format!("ws://{address}/");
     let ready = Arc::new(AtomicBool::new(false));
     let settings = Arc::new(settings);
     let mut tasks = JoinSet::new();
-    let capacity = Arc::new(Semaphore::new(settings.config.max_connections));
+    let capacity = Arc::new(Semaphore::new(settings.config.websocket.max_connections));
     let mut timer = interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     write_status(&settings, &url, false)?;

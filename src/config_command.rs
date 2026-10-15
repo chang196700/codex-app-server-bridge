@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde_json::Value as JsonValue;
 use std::{fs, io::ErrorKind, path::Path};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 #[derive(Debug, Subcommand)]
 pub enum Action {
@@ -71,8 +71,8 @@ pub fn prepare_service(
     // value read earlier while a concurrent `config set` could still change it.
     let mut document = read_document(path, true)?;
     let configured = parse_config(&document, path)?;
-    let explicit_socket = configured.transport == config::Transport::Socket
-        && configured.socket_path.is_some();
+    let explicit_socket =
+        configured.transport == config::Transport::Socket && configured.socket_path.is_some();
     let explicit_state = configured.state_dir.is_some();
     let settings = Settings::from_config(configured, user_home, codex_home, port, true)?;
     let table = document.as_table_mut();
@@ -81,16 +81,14 @@ pub fn prepare_service(
     // selected homes, but let defaults derived from them follow future edits.
     set_path(table, "user_home", &settings.user_home)?;
     set_path(table, "codex_home", &settings.codex_home)?;
-    if explicit_socket
-        && let Some(socket_path) = settings.socket_path.as_deref()
-    {
+    if explicit_socket && let Some(socket_path) = settings.socket_path.as_deref() {
         set_path(table, "socket_path", socket_path)?;
     }
     if explicit_state {
         set_path(table, "state_dir", &settings.state_dir)?;
     }
     if let Some(port) = port {
-        set_item(table, &["port"], Value::from(i64::from(port)))?;
+        set_item(table, &["websocket", "port"], Value::from(i64::from(port)))?;
     }
     if let Some(path) = settings.config.codex_path.as_deref() {
         set_path(table, "codex_path", path)?;
@@ -191,7 +189,7 @@ fn parse_value(input: &str, schema: &JsonValue) -> Result<Value> {
     Ok(value)
 }
 
-fn set_item(table: &mut Table, parts: &[&str], mut value: Value) -> Result<()> {
+fn set_item(table: &mut dyn TableLike, parts: &[&str], mut value: Value) -> Result<()> {
     let (name, rest) = parts.split_first().context("configuration key is empty")?;
     if rest.is_empty() {
         if let Some(item) = table.get_mut(name) {
@@ -212,7 +210,7 @@ fn set_item(table: &mut Table, parts: &[&str], mut value: Value) -> Result<()> {
         }
         let nested = table
             .get_mut(name)
-            .and_then(Item::as_table_mut)
+            .and_then(Item::as_table_like_mut)
             .context("configuration key traverses a value instead of a TOML table")?;
         set_item(nested, rest, value)?;
     }

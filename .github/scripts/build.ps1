@@ -81,7 +81,7 @@ try {
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     New-Item -ItemType Directory -Path $distribution -Force | Out-Null
     Copy-Item -LiteralPath $executable -Destination (Join-Path $staging $executableName)
-    Copy-Item -LiteralPath 'README.md', 'README_ZH.md' -Destination $staging
+    Copy-Item -LiteralPath 'README.md', 'README_ZH.md', 'LICENSE-MIT', 'LICENSE-APACHE' -Destination $staging
     @"
 Package: codex-app-server-bridge
 Version: $version

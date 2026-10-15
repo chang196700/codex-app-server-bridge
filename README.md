@@ -8,7 +8,7 @@ Supports Windows, macOS, and Linux, with fixed or dynamic ports and background s
 
 ## Downloads and automatic releases
 
-Download an archive for your operating system and architecture from [GitHub Releases](https://github.com/chang196700/codex-app-server-bridge/releases). Each release includes `SHA256SUMS`, and each archive contains the executable, both READMEs, and build information.
+Download an archive for your operating system and architecture from [GitHub Releases](https://github.com/chang196700/codex-app-server-bridge/releases). Each release includes `SHA256SUMS`, and each archive contains the executable, both READMEs, `LICENSE-MIT`, `LICENSE-APACHE`, and build information.
 
 | Platform | Architectures | Archive |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ For a Windows system service, run an elevated PowerShell session belonging to th
 
 ## Build and run
 
-Install Rust / rustup and the native Rust build tools for your platform. The repository's `rust-toolchain.toml` specifies the toolchain version.
+Install Rust / rustup and the native Rust build tools for your platform. The repository's `rust-toolchain.toml` pins Rust 1.99.0, the current stable release; native CI builds use the same version.
 
 ```sh
 cargo build --release --locked
@@ -117,17 +117,21 @@ auto_start_codex_app_server_daemon = false  # Start an unavailable daemon; disab
 # Optional; omit to find Codex on PATH or in common installation locations
 # codex_path = "/absolute/path/to/codex"
 
+poll_interval_ms = 2000         # Upstream health check interval; at least 100 ms
+
+# Use a state directory dedicated to this program
+# state_dir = "~/.local/state/codex-app-server-bridge"
+
+[websocket]
 host = "127.0.0.1"             # ::1 is also supported; only loopback addresses are accepted
 port = 0                       # 0 selects a dynamic port; e.g. 8765 selects a fixed port
-poll_interval_ms = 2000         # Upstream health check interval; at least 100 ms
 connect_timeout_ms = 3000       # Connection and handshake timeout; at least 100 ms
 max_connections = 64
 max_message_size = 67108864     # Bridge message/frame limit; Codex upstream limits still apply
 publish_codex_app_server_ws_url_environment = false  # Disabled by default; true enables automatic user environment updates
-
-# Use a state directory dedicated to this program
-# state_dir = "~/.local/state/codex-app-server-bridge"
 ```
+
+WebSocket settings belong in the `[websocket]` table. Before upgrading a configuration that has top-level `host`, `port`, `connect_timeout_ms`, `max_connections`, `max_message_size`, or `publish_codex_app_server_ws_url_environment`, move those fields into `[websocket]`; the old locations are rejected and are not migrated automatically. Keep `poll_interval_ms`, transport, daemon, and path settings at the top level, before `[websocket]`.
 
 Configuration precedence:
 
@@ -139,7 +143,7 @@ Configuration precedence:
 | Upstream transport | TOML `transport` → `proxy` (Codex `app-server proxy` over STDIO) |
 | Socket path | Used only when `transport = "socket"`; TOML `socket_path` → `<codex_home>/app-server-control/app-server-control.sock` |
 | Codex executable | TOML `codex_path` → automatic detection on `PATH` and in common installation locations |
-| Port | `--port` → TOML `port` → `0` |
+| Port | `--port` → TOML `websocket.port` → `0` |
 
 A TOML `user_home` value takes effect after the configuration is read; it does not change which configuration file is selected. A leading `~` expands to the selected user's home directory. Other relative paths resolve against the working directory from which the command is run. Service installation saves absolute paths. When editing a service's paths afterward, use absolute paths or `~` so they do not depend on the service manager's working directory. Unknown TOML fields are rejected so that typos are not silently ignored.
 
@@ -147,9 +151,9 @@ A TOML `user_home` value takes effect after the configuration is read; it does n
 
 ```sh
 codex-app-server-bridge config list
-codex-app-server-bridge config get port
-codex-app-server-bridge config set port 8765
-codex-app-server-bridge config set publish_codex_app_server_ws_url_environment true
+codex-app-server-bridge config get websocket.port
+codex-app-server-bridge config set websocket.port 8765
+codex-app-server-bridge config set websocket.publish_codex_app_server_ws_url_environment true
 codex-app-server-bridge config set transport proxy
 codex-app-server-bridge config set socket_path '~/.codex/app-server-control/app-server-control.sock'
 codex-app-server-bridge config get auto_start_codex_app_server_daemon
@@ -160,20 +164,20 @@ codex-app-server-bridge config set codex_path /absolute/path/to/codex
 codex-app-server-bridge config set auto_start_codex_app_server_daemon true
 
 # Read or edit a custom configuration file
-codex-app-server-bridge --config /path/to/bridge.toml config get port
-codex-app-server-bridge --config /path/to/bridge.toml config set port 8765
+codex-app-server-bridge --config /path/to/bridge.toml config get websocket.port
+codex-app-server-bridge --config /path/to/bridge.toml config set websocket.port 8765
 ```
 
 `config list` prints a JSON object containing the file's settings merged with built-in defaults. `config get KEY` prints only the selected value as JSON: strings include quotes, and an unset optional field is `null`. These commands show configuration values without applying runtime environment variables such as `CODEX_HOME` or CLI overrides such as `--port`.
 
-`config set KEY VALUE` accepts a value matching the field's type. Numbers and booleans use TOML syntax; string fields, including paths and `host`, also accept plain strings as shown above. There is no special unset or `null` syntax for removing a field. The command creates a missing configuration file, including one selected with `--config`, preserves other fields and comments, validates the complete configuration before writing, and prints the saved value as JSON. It does not write runtime overrides into the file.
+`config set KEY VALUE` accepts a value matching the field's type. Numbers and booleans use TOML syntax; string fields, including paths and `websocket.host`, also accept plain strings as shown above. There is no special unset or `null` syntax for removing a field. The command creates a missing configuration file, including one selected with `--config`, preserves other fields and comments, validates the complete configuration before writing, and prints the saved value as JSON. It does not write runtime overrides into the file.
 
-Configuration keys support dot-separated path navigation. The current schema has only top-level fields, so use names such as `port`, `transport`, and `socket_path`; there are no nested settings to address yet. Unknown fields or subkeys are rejected.
+Configuration keys support dot-separated path navigation: use `websocket.port` for a field in `[websocket]`, and `transport` or `socket_path` for a top-level field. Unknown fields or subkeys are rejected.
 
 The service reads the same configuration file that `config list`, `config get`, and `config set` select: the default `~/.codex-app-server-bridge/config.toml`, or the file supplied with `--config` at installation. Configuration changes do not reload a running instance. Restart a foreground process, or use `service restart` for an installed service; an operating-system service restart or reboot also applies the changes. Starting a stopped service reads the file again.
 
 ```sh
-codex-app-server-bridge config set port 63100
+codex-app-server-bridge config set websocket.port 63100
 codex-app-server-bridge service restart --scope user
 
 # Use the same custom file for configuration and service commands
@@ -199,15 +203,16 @@ On Windows, automatic daemon startup requires an ordinary, non-elevated user pro
 
 ## How environment updates work
 
-Automatic environment updates are **disabled by default**, including when `publish_codex_app_server_ws_url_environment` is omitted. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
-
-If an existing configuration uses the old name `publish_environment`, replace it with `publish_codex_app_server_ws_url_environment`, then restart the bridge.
+Automatic environment updates are **disabled by default**, including when `websocket.publish_codex_app_server_ws_url_environment` is omitted. The WebSocket bridge still works, and `status` shows its URL. In this mode, the program does not modify user environment variables or shell configuration.
 
 To set `CODEX_APP_SERVER_WS_URL` automatically, enable this option in `~/.codex-app-server-bridge/config.toml`:
 
 ```toml
+[websocket]
 publish_codex_app_server_ws_url_environment = true
 ```
+
+If `[websocket]` already exists, add or update the field in that table instead of creating a second table.
 
 After changing it, restart the foreground process or run `service restart` for an installed service. To disable an enabled publisher, first stop the old process so it can remove the variable it published, then set the option to `false` and start the bridge or service.
 
@@ -374,3 +379,7 @@ Each client connection has its own upstream connection; proxy mode starts and re
 The bridge listens only on loopback addresses and accepts only the root path `/`. It rejects query parameters and handshakes containing `Origin`; `Host` must match the published URL. Other paths, such as `/daemon/shutdown`, are not forwarded. Connections from browser pages are rejected; use a native WebSocket client.
 
 The bridge does not add token authentication. Loopback limits remote network access but does not isolate other users on the same machine. Run it in a trusted local environment, and use a controlled tunnel when remote access is needed. This implementation targets the Codex app-server WebSocket protocol exposed by proxy or the direct control endpoint. Other versions require revalidation if they change the handshake or protocol.
+
+## License
+
+Licensed under either the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option (`MIT OR Apache-2.0`).

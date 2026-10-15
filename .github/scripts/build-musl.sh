@@ -83,7 +83,7 @@ if [ -e "$staging" ]; then
     exit 1
 fi
 mkdir -p "$staging" "$repository/dist"
-cp "$executable" README.md README_ZH.md "$staging/"
+cp "$executable" README.md README_ZH.md LICENSE-MIT LICENSE-APACHE "$staging/"
 chmod 755 "$staging/codex-app-server-bridge"
 cat > "$staging/BUILDINFO.txt" <<EOF
 Package: codex-app-server-bridge
