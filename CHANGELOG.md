@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.6...v0.1.7) - 2026-10-15
+
+### Added
+
+- add service modes and multiple authenticated WebSocket listeners
+
 ## [0.1.6](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.5...v0.1.6) - 2026-10-15
 
 ### Fixed
