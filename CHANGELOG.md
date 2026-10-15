@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.5...v0.1.6) - 2026-10-15
+
+### Fixed
+
+- keep proxy healthy when probe cleanup times out
+
 ## [0.1.5](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.4...v0.1.5) - 2026-10-15
 
 ### Added
