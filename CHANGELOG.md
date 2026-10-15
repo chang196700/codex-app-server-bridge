@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add service modes and multiple authenticated WebSocket listeners
 
+### Fixed
+
+- retain release checks when restoring an existing tag
+- publish release commits only after all native builds pass
+
 ## [0.1.6](https://github.com/chang196700/codex-app-server-bridge/compare/v0.1.5...v0.1.6) - 2026-10-15
 
 ### Fixed
